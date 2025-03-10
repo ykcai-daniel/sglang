@@ -43,10 +43,11 @@ srt = [
     "sglang[runtime_common]",
     "sgl-kernel>=0.0.3.post6",
     "flashinfer_python>=0.2.1.post2",
-    "torch==2.5.1",
+    "torch",
     "vllm>=0.6.4.post1,<=0.7.2",
     "cuda-python",
     "nvidia_cudnn_frontend",
+    "nvidia-cudnn-cu12>=9.5.0.0",
     "outlines>=0.0.44,<=0.1.11",
 ]
 
