@@ -4,8 +4,10 @@ from typing import TYPE_CHECKING
 
 import torch
 import cudnn
+import time
 import logging
 from dataclasses import dataclass
+import math
 
 from sglang.srt.layers.attention import AttentionBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -37,7 +39,7 @@ class CuDNNBackend(AttentionBackend):
         seq_len_kv_tensor_info = "seq_len_kv_tensor_info"
         o = "o"
 
-    def __init__(self, model_runner: ModelRunner, use_cuda_graph = True):
+    def __init__(self, model_runner: ModelRunner, extend_seq_len_interval = 64):
         super().__init__()
         self.forward_metadata = None
 
@@ -50,8 +52,9 @@ class CuDNNBackend(AttentionBackend):
             max_num_reqs = model_runner.server_args.max_running_requests
         )
 
+        self._extend_seq_len_interval = extend_seq_len_interval
         self._decode_graphs=self._init_decode_graphs()
-        self._forward_graphs=self._init_prefill_graphs()
+        self._prefill_graphs=self._init_prefill_graphs()
 
 
     def _create_cudnn_graph(self, batch_size:int, query_shape, kv_container_shape, kv_page_table_shape, seq_len_shape,max_seq_len):
@@ -161,9 +164,10 @@ class CuDNNBackend(AttentionBackend):
                 stride *= dim
             return list(reversed(strides))
     
-    def _init_decode_graphs(self,max_batch_size):
+    def _init_decode_graphs(self):
         
         max_seq_len = self._model_runner.server_args.max_total_tokens
+        decode_graphs = []
         for batch_size in range(1,max_batch_size+1):
             # Radix Attention use KVCache of Block Size 1
 
@@ -173,14 +177,30 @@ class CuDNNBackend(AttentionBackend):
             seq_len_shape=[batch_size,1,1,1]
 
             tensor_args,graph = self._create_cudnn_graph(batch_size, q_shape, kv_container_shape, kv_page_table_shape, seq_len_shape,max_seq_len)
-            self._decode_graphs.append((tensor_args, graph))
-            assert batch_size == len(self._decode_graphs), f"batch size {batch_size} does not match the number of graphs {len(self._decode_graphs)}"
+            decode_graphs.append((tensor_args, graph))
+            assert batch_size == len(decode_graphs), f"batch size {batch_size} does not match the number of graphs {len(self._decode_graphs)}"
 
-        return self._decode_graphs
+        return decode_graphs
 
     
-    def _init_prefill_graphs(self,max_batch_size):
-        pass
+    def _init_prefill_graphs(self):
+        max_seq_len = self._model_runner.server_args.max_total_tokens
+        prefill_graphs = []
+        ceil_dev = (max_seq_len+self._extend_seq_len_interval+1)/self._extend_seq_len_interval
+        for b in range(1, ceil_dev):
+            # Create a new graph for each batch size with step size of extend_seq_len_interval (default 64)
+            batch_size = b * self._extend_seq_len_interval
+
+            q_shape=[batch_size, self._model_runner.model_config.num_attention_heads,1,self._model_runner.model_config.head_dim]
+            kv_container_shape=[self._model_runner.server_args.max_total_tokens,self._model_runner.model_config.num_attention_heads,1,self._model_runner.model_config.head_dim]
+            kv_page_table_shape=[self._model_runner.server_args.max_running_requests,self._model_runner.server_args.max_total_tokens]
+            seq_len_shape=[batch_size,1,1,1]
+
+            tensor_args,graph = self._create_cudnn_graph(batch_size, q_shape, kv_container_shape, kv_page_table_shape, seq_len_shape,max_seq_len)
+            prefill_graphs.append((tensor_args, graph))
+            assert batch_size == self._extend_seq_len_interval*len(prefill_graphs), f"batch size {batch_size} does not match the number of graphs {len(self._decode_graphs)}"
+
+        return prefill_graphs
 
 
     
@@ -218,7 +238,136 @@ class CuDNNBackend(AttentionBackend):
         Returns:
             output: [num_tokens, num_heads, head_size]
         """
-        pass
+        assert seq_lens.shape[0] == extend_prefix_lens.shape[0]
+        assert seq_lens.shape[0] == extend_seq_lens.shape[0]
+
+        
+
+        start_time = time.perf_counter()
+
+        # B = batch_size
+        B = seq_lens.shape[0]
+
+        assert query.shape[0] == extend_seq_lens.sum(), (
+            f"query.shape[0] = {query.shape[0]}, but sum(extend_seq_lens) = {extend_seq_lens.sum()}"
+        )
+
+
+        # how many tokens can store in KV cache
+        max_seq_len = k_cache.shape[0]
+
+        # 1) Reshape the multi-token query to [B, max_new_tokens, H, D] in a padded fashion
+        H = query.shape[1]
+        D = query.shape[2]
+        max_new_tokens = extend_seq_lens.max()
+        # find the first prefill graph whose sequence length is longer than max_new_tokens
+
+        for i, (tensor_args, graph) in enumerate(self._prefill_graphs):
+            if i * self._extend_seq_len_interval >= max_new_tokens:
+                break
+        tensor_args, graph = self._prefill_graphs[i]
+        pad_size = i * self._extend_seq_len_interval
+
+        # TODO: maybe using ragged tensor?
+        padded_query = query.new_zeros((B, pad_size, H, D))
+
+        # Fill in each sequence's slice
+        offset = 0
+        for i in range(B):
+            length_i = extend_seq_lens[i].item()
+            padded_query[i, :length_i, :, :] = query[offset : offset + length_i, :, :]
+            offset += length_i
+
+        # [B, H, max_new_tokens, D]
+        padded_query = padded_query.movedim(2, 1)
+
+
+
+        # query contains num_tokens queries batched togather
+        q_gpu = padded_query
+
+        # heads, tokens, head size
+        # The tokens of queries are indexed by req_to_token
+        s, h, d = k_cache.shape
+        # Block Size of Paged Cache, 1 since only one token per block
+        b = 1
+
+        # 3) Reshape k_cache, v_cache into container shapes for “paged” attention
+        # container: num_blocks, num heads, tokens_per_block, dim
+        # TODO: permute for correctness
+        container_k_gpu = k_cache.view(s,h,b,d)
+        print('cache shape: ',container_k_gpu.shape)
+        container_v_gpu = v_cache.view(s,h,b,d)
+
+        # 4) Build the page table
+        # only want prefix + the newly added tokens for each sequence
+        # Then pad it to the maximum across the batch
+        max_ctx_len = (extend_prefix_lens + extend_seq_lens).max().item()
+        list_req_tokens = []
+        for i in range(B):
+            total_len = (extend_prefix_lens[i] + extend_seq_lens[i]).item()
+            row_i = req_to_token[req_pool_indices[i], :total_len]
+            # Pad up to max_ctx_len
+            padded_indices = row_i.new_zeros(max_ctx_len)
+            padded_indices[:total_len] = row_i
+            list_req_tokens.append(padded_indices)
+        
+        # Now stack into a single [B, max_ctx_len]
+        per_req_tokens = torch.stack(list_req_tokens, dim=0)
+
+        # reshape to [B, 1, max_ctx_len, 1]
+        page_table_k_gpu = per_req_tokens.view(per_req_tokens.shape[0],1,per_req_tokens.shape[1],1)
+        print("paged table k shape: ",page_table_k_gpu.shape)
+        page_table_v_gpu = per_req_tokens.view(per_req_tokens.shape[0],1,per_req_tokens.shape[1],1)
+        print("page table v shape: ",page_table_v_gpu.shape)
+
+        # 5) Sequence lengths
+        seq_lens_kv = (extend_prefix_lens + extend_seq_lens).view(B, 1, 1, 1)
+        seq_lens_q = extend_seq_lens.view(B, 1, 1, 1)
+
+
+        # 7) Set output tensor
+        # CuDNN output will also be [B, H, max_new_tokens, D]
+        # eventually flatten it back to [sum_of_new_tokens_across_batch, H, D]
+        
+        #output = output.view(*padded_query.shape)
+        B_out, H_out, S_out, D_out = padded_query.shape
+        output = output.new_zeros((B_out, H_out, S_out, D_out))
+
+        build_graph_time = time.perf_counter()
+
+        variable_pack = {
+            tensor_args[self._ArgMapKeys.q]: q_gpu,
+            tensor_args[self._ArgMapKeys.k_container]: container_k_gpu,
+            tensor_args[self._ArgMapKeys.v_container]: container_v_gpu,
+            tensor_args[self._ArgMapKeys.k_page_table]: page_table_k_gpu,
+            tensor_args[self._ArgMapKeys.v_page_table]: page_table_v_gpu,  
+            tensor_args[self._ArgMapKeys.seq_len_q_tensor_info]: seq_lens_q,
+            tensor_args[self._ArgMapKeys.seq_len_kv_tensor_info]: seq_lens_kv,
+            tensor_args[self._ArgMapKeys.o]: output,
+        }
+
+
+        workspace = torch.empty(graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
+        graph.execute(variable_pack, workspace)
+        print(output.shape)
+
+        # 8) Reshape the output back to [sum_of_new_tokens_across_batch, H, D]
+        final_out = []
+        offset = 0
+        for i in range(B):
+            length_i = extend_seq_lens[i].item()
+            seq_out = output[i, :, :length_i, :] 
+            # permute => [length_i, H, D]
+            seq_out = seq_out.movedim(0, 1)
+            final_out.append(seq_out)
+        final_output = torch.cat(final_out, dim=0)
+        end_time = time.perf_counter()
+
+        print(f"Graph Construction Time: {build_graph_time-start_time}")
+        print(f"Forward Time: {end_time-build_graph_time}")
+
+        return final_output
 
       
 
