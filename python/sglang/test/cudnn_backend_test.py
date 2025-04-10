@@ -1,18 +1,20 @@
 from dataclasses import dataclass
+import dataclasses
 #from sglang.srt.layers.attention import cudnn_backend
 import torch
 import logging
 import math
 import cudnn
 import time
+import json
 
 @dataclass
 class InputParameters:
     num_token = 10
-    num_heads = 4
+    num_heads = 32
     head_size = 128
     max_total_num_tokens = 300
-    max_num_reqs = 100
+    max_num_reqs = 10
     max_context_lenght = 300
     num_seqs = 10
 
@@ -49,7 +51,7 @@ class CuDNNBackend():
         seq_len_kv_tensor_info = "seq_len_kv_tensor_info"
         o = "o"
 
-    def __init__(self, model_runner, input_shape_parems = None, extend_seq_len_interval = 64):
+    def __init__(self, model_runner, input_shape_parems = None, extend_seq_len_interval = 128):
         super().__init__()
         self.forward_metadata = None
 
@@ -84,11 +86,11 @@ class CuDNNBackend():
             )
 
             # q shape: [num_token, num_heads, 1,  head_size], where 1 is sequence length
-        print("batch size: ",batch_size)
-        print("query shape: ",query_shape)
-        print("kv container shape: ",kv_container_shape)
-        print("kv page table shape: ",kv_page_table_shape)
-        print("seq len shape: ",seq_len_shape)
+        # print("batch size: ",batch_size)
+        # print("query shape: ",query_shape)
+        # print("kv container shape: ",kv_container_shape)
+        # print("kv page table shape: ",kv_page_table_shape)
+        # print("seq len shape: ",seq_len_shape)
 
         q_cudnn = graph.tensor(
             name="q",
@@ -146,8 +148,10 @@ class CuDNNBackend():
             k=k_container_cudnn,  # Container K: non contiguous container with K blocks
             v=v_container_cudnn,  # Container V: non contiguous container with V blocks
             is_inference=True,
-            #attn_scale=0.05,
-            use_causal_mask=False,
+            # TODO: passing atten_scale as arg
+            attn_scale=1/math.sqrt(self.input_size_params.head_size),
+            # TODO: enable passing casual argument in graph or cache graph for both casual_mask = True and False
+            use_causal_mask=True,
             use_padding_mask=True,
             seq_len_q=q_seq_len,
             seq_len_kv=kv_seq_len,
@@ -194,7 +198,8 @@ class CuDNNBackend():
         
         max_seq_len = self.input_size_params.max_total_num_tokens
         decode_graphs = []
-        for batch_size in range(10,max_batch_size+1):
+        print("Create decode graphs for batch sizes: ",max_batch_size)
+        for batch_size in range(1,max_batch_size+1):
             # Radix Attention use KVCache of Block Size 1
 
             q_shape=[batch_size, self.input_size_params.num_heads,1,self.input_size_params.head_size]
@@ -204,7 +209,7 @@ class CuDNNBackend():
 
             tensor_args,graph = self._create_cudnn_graph(batch_size, q_shape, kv_container_shape, kv_page_table_shape, seq_len_shape,max_seq_len)
             decode_graphs.append((tensor_args, graph))
-            assert batch_size == len(decode_graphs), f"batch size {batch_size} does not match the number of graphs {len(self._decode_graphs)}"
+            assert batch_size == len(decode_graphs), f"batch size {batch_size} does not match the number of graphs {len(decode_graphs)}"
 
         return decode_graphs
 
@@ -217,6 +222,7 @@ class CuDNNBackend():
         prefill_graphs = []
         max_seq_len = self.input_size_params.max_total_num_tokens
         for batch_size in range(1, max_batch_size+1):
+            print("Creating Prefill Graphs for batch size ",batch_size)
             prefill_graphs_per_batch_size = []
             seq_len = self._extend_seq_len_interval
             while seq_len < self.input_size_params.max_total_num_tokens:
@@ -230,6 +236,8 @@ class CuDNNBackend():
 
                 tensor_args,graph = self._create_cudnn_graph(batch_size, q_shape, kv_container_shape, kv_page_table_shape, seq_len_shape,max_seq_len)
                 prefill_graphs_per_batch_size.append((tensor_args, graph))
+                seq_len += self._extend_seq_len_interval
+
             prefill_graphs.append(prefill_graphs_per_batch_size)
         return prefill_graphs
     
@@ -278,7 +286,14 @@ class CuDNNBackend():
         assert query.shape[0] == extend_seq_lens.sum(), (
             f"query.shape[0] = {query.shape[0]}, but sum(extend_seq_lens) = {extend_seq_lens.sum()}"
         )
+        
+        assert B == extend_seq_lens.shape[0], (
+            f"batch size must be the same, but got {B} and {extend_seq_lens.shape[0]}"
+        )
 
+        assert B == extend_prefix_lens.shape[0], (
+            f"batch size must be the same, but got {B} and {extend_prefix_lens.shape[0]}"
+        )
 
         # how many tokens can store in KV cache
         max_seq_len = k_cache.shape[0]
@@ -350,6 +365,7 @@ class CuDNNBackend():
         print("page table v shape: ",page_table_v_gpu.shape)
 
         # 5) Sequence lengths
+        extend_prefix_lens_list = extend_prefix_lens.tolist()
         seq_lens_kv = (extend_prefix_lens + extend_seq_lens).view(B, 1, 1, 1)
         seq_lens_q = extend_seq_lens.view(B, 1, 1, 1)
 
@@ -383,8 +399,10 @@ class CuDNNBackend():
         # 8) Reshape the output back to [sum_of_new_tokens_across_batch, H, D]
         final_out = []
         offset = 0
+        
         for i in range(B):
-            length_i = extend_seq_lens[i].item()
+            length_i = extend_prefix_lens_list[i]
+            print("Length i :",length_i)
             seq_out = output[i, :, :length_i, :] 
             # permute => [length_i, H, D]
             seq_out = seq_out.movedim(0, 1)
@@ -732,14 +750,14 @@ class TorchNativeAttnBackend():
 
 def test_correctness(test_decode = True, test_extend = True):
     input_parem = InputParameters()
+    print("Input Parameters: ", json.dumps(dataclasses.asdict(input_parem), indent=4))
     cudnn_bknd = CuDNNBackend(None,input_shape_parems=input_parem)
     torch_native_backend = TorchNativeAttnBackend()
 
     vals = torch.randint(low=1, high=6, size=(input_parem.num_seqs,))
     input_parem.num_token = sum(vals)
     # TODO: dtype
-    query = torch.randn([input_parem.num_token, input_parem.num_heads, input_parem.head_size]).half().cuda()
-    output = torch.randn([input_parem.num_token, input_parem.num_heads, input_parem.head_size]).half().cuda()
+
     k_cache = torch.randn([input_parem.max_total_num_tokens, input_parem.num_heads, input_parem.head_size]).half().cuda()
     v_cache = torch.randn([input_parem.max_total_num_tokens, input_parem.num_heads, input_parem.head_size]).half().cuda()
 
@@ -763,6 +781,8 @@ def test_correctness(test_decode = True, test_extend = True):
     # logging.info("Start Extend")
 
     if test_decode:
+        query = torch.randn([input_parem.num_seqs, input_parem.num_heads, input_parem.head_size]).half().cuda()
+        output = torch.randn([input_parem.num_seqs, input_parem.num_heads, input_parem.head_size]).half().cuda()
         output = cudnn_bknd._run_sdpa_forward_decode(
             query=query,
             output=output,
@@ -774,7 +794,7 @@ def test_correctness(test_decode = True, test_extend = True):
             scaling=scaling
         )
 
-        torch_output = torch.randn([input_parem.num_token, input_parem.num_heads, input_parem.head_size]).half().cuda()
+        torch_output = torch.randn([input_parem.num_seqs, input_parem.num_heads, input_parem.head_size]).half().cuda()
         start_time =time.perf_counter()
         torch_output = torch_native_backend._run_sdpa_forward_decode(
             query=query,
@@ -784,7 +804,8 @@ def test_correctness(test_decode = True, test_extend = True):
             req_to_token=req_to_token,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
-            scaling=scaling
+            scaling=scaling,
+            causal=True,
         )
         end_time =time.perf_counter()
         print(f"torch sdpa decode time: {end_time-start_time}")
@@ -799,6 +820,8 @@ def test_correctness(test_decode = True, test_extend = True):
 
     if test_extend:
     # Force sum(extend_seq_lens) = input_parem.num_token
+        query = torch.randn([input_parem.num_token, input_parem.num_heads, input_parem.head_size]).half().cuda()
+        output = torch.randn([input_parem.num_token, input_parem.num_heads, input_parem.head_size]).half().cuda()
         current_sum = extend_seq_lens.sum()
         diff = input_parem.num_token - current_sum
         extend_seq_lens[0] += diff
