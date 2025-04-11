@@ -14,7 +14,7 @@ class InputParameters:
     num_heads = 32
     head_size = 128
     max_total_num_tokens = 300
-    max_num_reqs = 10
+    max_num_reqs = 100
     max_context_lenght = 300
     num_seqs = 10
 
@@ -73,8 +73,9 @@ class CuDNNBackend():
         # for batch_size, graph[batch_size-1] is the corresponding graph
 
         # self._prefill_graph[batch_size][seq_len] is the cudnn graph for batch_size and seq_len
-        self._prefill_graphs = self._init_prefill_graphs(self.input_size_params.max_num_reqs)
-        self._decode_graphs=self._init_decode_graphs(self.input_size_params.max_num_reqs)
+        # TODO: batch size parameter
+        self._prefill_graphs = self._init_prefill_graphs(self.input_size_params.num_seqs)
+        self._decode_graphs=self._init_decode_graphs(self.input_size_params.num_seqs)
 
 
 
@@ -345,8 +346,11 @@ class CuDNNBackend():
         # 4) Build the page table
         # only want prefix + the newly added tokens for each sequence
         # Then pad it to the maximum across the batch
-        max_ctx_len = (extend_prefix_lens + extend_seq_lens).max().item()
+
+        # set the page table size to max context length to avoid building more customized cudnn graphs
+        max_ctx_len = self.input_size_params.max_context_lenght
         list_req_tokens = []
+        # TODO: page table should be fixed size
         for i in range(B):
             total_len = (extend_prefix_lens[i] + extend_seq_lens[i]).item()
             row_i = req_to_token[req_pool_indices[i], :total_len]
@@ -394,14 +398,14 @@ class CuDNNBackend():
 
         workspace = torch.empty(graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
         graph.execute(variable_pack, workspace)
-        print(output.shape)
+        print("CuDNN Output Shape: ",output.shape)
 
         # 8) Reshape the output back to [sum_of_new_tokens_across_batch, H, D]
         final_out = []
         offset = 0
         
         for i in range(B):
-            length_i = extend_prefix_lens_list[i]
+            length_i = extend_seq_lens[i].item()
             print("Length i :",length_i)
             seq_out = output[i, :, :length_i, :] 
             # permute => [length_i, H, D]
@@ -754,8 +758,7 @@ def test_correctness(test_decode = True, test_extend = True):
     cudnn_bknd = CuDNNBackend(None,input_shape_parems=input_parem)
     torch_native_backend = TorchNativeAttnBackend()
 
-    vals = torch.randint(low=1, high=6, size=(input_parem.num_seqs,))
-    input_parem.num_token = sum(vals)
+
     # TODO: dtype
 
     k_cache = torch.randn([input_parem.max_total_num_tokens, input_parem.num_heads, input_parem.head_size]).half().cuda()
@@ -766,15 +769,12 @@ def test_correctness(test_decode = True, test_extend = True):
     # the request index of inputs sequences in req_to_token
     req_pool_indices = torch.randint(low=0,high=input_parem.max_num_reqs,size=[input_parem.num_seqs],dtype=torch.int32).cuda()
 
-    extend_prefix_lens = torch.randint(low=0,high=5,size=[input_parem.num_seqs],dtype=torch.int32).cuda()
-    
-    extend_seq_lens = torch.tensor(vals, dtype=torch.int32).cuda()
 
     # req_to_token[request_index]: list of index of tokens in query and value for that request_index
     # sum(len(tokens_per_request)) = num_tokens in query
     req_to_token = torch.randint(low=0,high=input_parem.num_token,size=[input_parem.max_num_reqs, input_parem.max_context_lenght],dtype=torch.int32).cuda()
     # seq_lens = torch.randint(low=0,high=input_parem.max_total_num_tokens,size=[input_parem.num_seqs]).cuda()
-    seq_lens = (extend_prefix_lens + extend_seq_lens).cuda()
+
     scaling = 1/math.sqrt(input_parem.head_size)
 
 
@@ -783,6 +783,8 @@ def test_correctness(test_decode = True, test_extend = True):
     if test_decode:
         query = torch.randn([input_parem.num_seqs, input_parem.num_heads, input_parem.head_size]).half().cuda()
         output = torch.randn([input_parem.num_seqs, input_parem.num_heads, input_parem.head_size]).half().cuda()
+        seq_lens = torch.randint(low=10,high=input_parem.max_context_lenght,size=[input_parem.num_seqs],dtype=torch.int32).cuda()
+        
         output = cudnn_bknd._run_sdpa_forward_decode(
             query=query,
             output=output,
@@ -820,11 +822,22 @@ def test_correctness(test_decode = True, test_extend = True):
 
     if test_extend:
     # Force sum(extend_seq_lens) = input_parem.num_token
+
+        extend_seq_lens = torch.randint(low=1, high=6, size=(input_parem.num_seqs,)).cuda()
+        print("Extend seq lens: ",extend_seq_lens.tolist())
+        input_parem.num_token = sum(extend_seq_lens)
+        print("Output Size should be: ",input_parem.num_token)
+        extend_prefix_lens = torch.randint(low=1,high=5,size=[input_parem.num_seqs],dtype=torch.int32).cuda()
+        print("Extend prefix lens: ",extend_prefix_lens.tolist())
+        seq_lens = (extend_prefix_lens + extend_seq_lens).cuda()
+
         query = torch.randn([input_parem.num_token, input_parem.num_heads, input_parem.head_size]).half().cuda()
         output = torch.randn([input_parem.num_token, input_parem.num_heads, input_parem.head_size]).half().cuda()
-        current_sum = extend_seq_lens.sum()
-        diff = input_parem.num_token - current_sum
-        extend_seq_lens[0] += diff
+
+
+        # current_sum = extend_seq_lens.sum()
+        # diff = input_parem.num_token - current_sum
+        # extend_seq_lens[0] += diff
         assert extend_seq_lens.sum() == input_parem.num_token, \
             "extend_seq_lens sum doesn't match input_parem.num_token."
 
@@ -859,7 +872,8 @@ def test_correctness(test_decode = True, test_extend = True):
             seq_lens=seq_lens,
             extend_prefix_lens=extend_prefix_lens,
             extend_seq_lens=extend_seq_lens,
-            scaling=scaling
+            scaling=scaling,
+            causal=True,
         )
         torch.cuda.synchronize()
         print(f"[Torch Native] Peak memory: {torch.cuda.max_memory_allocated() / 1024 / 1024:.2f} MB")
