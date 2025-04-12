@@ -75,7 +75,7 @@ class CuDNNBackend():
 
         # self._prefill_graph[batch_size][seq_len] is the cudnn graph for batch_size and seq_len
         # TODO: batch size parameter
-        self._prefill_graphs = self._init_prefill_graphs(self.input_size_params.num_seqs)
+        # self._prefill_graphs = self._init_prefill_graphs(self.input_size_params.num_seqs)
         self._decode_graphs=self._init_decode_graphs(self.input_size_params.num_seqs)
 
 
@@ -270,44 +270,17 @@ class CuDNNBackend():
         enable_gqa=False,
         causal=False,
     ):
-        """Run the extend forward by using torch native sdpa op.
-
-        Args:
-            query: [num_tokens, num_heads, head_size]
-            output: [num_tokens, num_heads, head_size]
-            k_cache: [max_total_num_tokens, num_heads, head_size]
-            v_cache: [max_total_num_tokens, num_heads, head_size]
-            req_to_token: [max_num_reqs, max_context_len]
-            req_pool_indices: [num_seqs]
-            seq_lens: [num_seqs]
-            extend_prefix_lens: [num_seqs]
-            extend_seq_lens: [num_seqs]
-            scaling: float or None
-            enable_gqa: bool
-            causal: bool
-
-        Returns:
-            output: [num_tokens, num_heads, head_size]
-        """
         assert seq_lens.shape[0] == extend_prefix_lens.shape[0]
         assert seq_lens.shape[0] == extend_seq_lens.shape[0]
 
+        start_time =time.perf_counter()
 
-        start_time = time.perf_counter()
-
+        # B = batch_size
         B = seq_lens.shape[0]
-
         assert query.shape[0] == extend_seq_lens.sum(), (
             f"query.shape[0] = {query.shape[0]}, but sum(extend_seq_lens) = {extend_seq_lens.sum()}"
         )
-        
-        assert B == extend_seq_lens.shape[0], (
-            f"batch size must be the same, but got {B} and {extend_seq_lens.shape[0]}"
-        )
 
-        assert B == extend_prefix_lens.shape[0], (
-            f"batch size must be the same, but got {B} and {extend_prefix_lens.shape[0]}"
-        )
 
         # how many tokens can store in KV cache
         max_seq_len = k_cache.shape[0]
@@ -315,34 +288,34 @@ class CuDNNBackend():
         # 1) Reshape the multi-token query to [B, max_new_tokens, H, D] in a padded fashion
         H = query.shape[1]
         D = query.shape[2]
-        max_new_tokens = extend_seq_lens.max()
-        # find the first prefill graph whose sequence length is longer than max_new_tokens
+        max_new_tokens = self.input_size_params.max_total_num_tokens
 
-        prefill_graphs_for_batch_size = self._prefill_graphs[B-1]
-        for i, (tensor_args, graph) in enumerate(prefill_graphs_for_batch_size):
-            if (i + 1) * self._extend_seq_len_interval >= max_new_tokens:
-                break
-        tensor_args, graph = prefill_graphs_for_batch_size[i]
-        pad_size = (i + 1) * self._extend_seq_len_interval
-        print(f"Padding Query from size {max_new_tokens} to size: {pad_size}")
-
-        # TODO: maybe using ragged tensor?
-        padded_query = query.new_zeros((B, pad_size, H, D))
+        padded_query = query.new_zeros((B, max_new_tokens, H, D))
 
         # Fill in each sequence's slice
         offset = 0
         for i in range(B):
             length_i = extend_seq_lens[i].item()
+            prefix_i = extend_prefix_lens[i].item()
             padded_query[i, :length_i, :, :] = query[offset : offset + length_i, :, :]
             offset += length_i
 
         # [B, H, max_new_tokens, D]
         padded_query = padded_query.movedim(2, 1)
 
-
+        
+        # 2) Build CuDNN pygraph and define input tensors
+        # TODO: determine data type
+        graph = cudnn.pygraph(
+            io_data_type=cudnn.data_type.HALF,
+            intermediate_data_type=cudnn.data_type.FLOAT,
+            compute_data_type=cudnn.data_type.FLOAT,
+        )
+        print(graph)
 
         # query contains num_tokens queries batched togather
         q_gpu = padded_query
+        q = graph.tensor_like(q_gpu)
 
         # heads, tokens, head size
         # The tokens of queries are indexed by req_to_token
@@ -357,16 +330,23 @@ class CuDNNBackend():
         print('cache shape: ',container_k_gpu.shape)
         container_v_gpu = v_cache.view(s,h,b,d)
 
-        # 4) Build the page table
+        container_k = graph.tensor_like(container_k_gpu)
+        container_v = graph.tensor_like(container_v_gpu)
+
+        # 4) Sequence lengths
+        seq_lens_kv = (extend_prefix_lens + extend_seq_lens).view(B, 1, 1, 1)
+        seq_lens_q = extend_seq_lens.view(B, 1, 1, 1)
+
+        seq_len_q_tensor_info = graph.tensor_like(seq_lens_q)
+        seq_len_kv_tensor_info = graph.tensor_like(seq_lens_kv)
+
+        # 5) Build the page table
         # only want prefix + the newly added tokens for each sequence
         # Then pad it to the maximum across the batch
-
-        # set the page table size to max context length to avoid building more customized cudnn graphs
-        max_ctx_len = self.input_size_params.max_context_lenght
+        max_ctx_len = (extend_prefix_lens + extend_seq_lens).max().item()
         list_req_tokens = []
-        # TODO: page table should be fixed size
         for i in range(B):
-            total_len = (extend_prefix_lens[i] + extend_seq_lens[i]).item()
+            total_len = seq_lens_kv[i].item()
             row_i = req_to_token[req_pool_indices[i], :total_len]
             # Pad up to max_ctx_len
             padded_indices = row_i.new_zeros(max_ctx_len)
@@ -381,13 +361,28 @@ class CuDNNBackend():
         print("paged table k shape: ",page_table_k_gpu.shape)
         page_table_v_gpu = per_req_tokens.view(per_req_tokens.shape[0],1,per_req_tokens.shape[1],1)
         print("page table v shape: ",page_table_v_gpu.shape)
+        page_table_k = graph.tensor_like(page_table_k_gpu)
+        page_table_v = graph.tensor_like(page_table_v_gpu)
 
-        # 5) Sequence lengths
-        extend_prefix_lens_list = extend_prefix_lens.tolist()
-        seq_lens_kv = seq_lens.view(B, 1, 1, 1)
-        # seq_lens_kv = torch.tensor(extend_prefix_lens_list, device=extend_prefix_lens.device).view(B, 1, 1, 1
-        seq_lens_q = extend_seq_lens.view(B, 1, 1, 1)
 
+
+        # 6) Build the SDPA operation
+        o, _ = graph.sdpa(
+            name="sdpa",
+            q=q,
+            k=container_k,  # Container K: non contiguous container with K blocks
+            v=container_v,  # Container V: non contiguous container with V blocks
+            is_inference=True,
+            attn_scale=1/math.sqrt(self.input_size_params.head_size),
+            use_causal_mask=False,
+            use_padding_mask=True,
+            seq_len_q=seq_len_q_tensor_info,
+            seq_len_kv=seq_len_kv_tensor_info,
+            paged_attention_k_table=page_table_k,  # Page Table K: Tensor containing offsets to the container with K blocks
+            paged_attention_v_table=page_table_v,  # Page Table V: Tensor containing offsets to the container with V blocks
+            paged_attention_max_seq_len_kv=max_ctx_len,  # The maximum sequence length for K caches (this is optional, but recommended)
+        )
+        logging.info(graph)
 
         # 7) Set output tensor
         # CuDNN output will also be [B, H, max_new_tokens, D]
@@ -395,37 +390,43 @@ class CuDNNBackend():
         
         #output = output.view(*padded_query.shape)
         B_out, H_out, S_out, D_out = padded_query.shape
-        output_padded = output.new_zeros((B_out, H_out, S_out, D_out))
+        output = output.new_zeros((B_out, H_out, S_out, D_out))
+        dims = output.shape
+        strides = output.stride()
+
+
+        o.set_output(True).set_dim(dims).set_stride(strides)
+        graph.validate()
+        graph.build_operation_graph()
+        graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+        graph.check_support()
+        graph.build_plans()
 
         build_graph_time = time.perf_counter()
 
-        variable_pack = {
-            tensor_args[self._ArgMapKeys.q]: q_gpu,
-            tensor_args[self._ArgMapKeys.k_container]: container_k_gpu,
-            tensor_args[self._ArgMapKeys.v_container]: container_v_gpu,
-            tensor_args[self._ArgMapKeys.k_page_table]: page_table_k_gpu,
-            tensor_args[self._ArgMapKeys.v_page_table]: page_table_v_gpu,  
-            tensor_args[self._ArgMapKeys.seq_len_q_tensor_info]: seq_lens_q,
-            tensor_args[self._ArgMapKeys.seq_len_kv_tensor_info]: seq_lens_kv,
-            tensor_args[self._ArgMapKeys.o]: output_padded,
+        variant_pack = {
+            q: q_gpu,
+            container_k: container_k_gpu,
+            container_v: container_v_gpu,
+            page_table_k: page_table_k_gpu,
+            page_table_v: page_table_v_gpu,
+            seq_len_q_tensor_info: seq_lens_q,
+            seq_len_kv_tensor_info: seq_lens_kv,
+            o: output,
         }
 
-        print("Sequence Length q: ",seq_lens_q.tolist())
-        print("Sequence Length kv: ",seq_lens_kv.tolist())
 
         workspace = torch.empty(graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
-        graph.execute(variable_pack, workspace)
-        print("CuDNN Output Shape: ",output.shape)
+        graph.execute(variant_pack, workspace)
+        print(output.shape)
+        torch.cuda.synchronize()
 
         # 8) Reshape the output back to [sum_of_new_tokens_across_batch, H, D]
         final_out = []
         offset = 0
-        
         for i in range(B):
             length_i = extend_seq_lens[i].item()
-            prefix_len = extend_prefix_lens[i].item()
-            print("Length i :",length_i)
-            seq_out = output_padded[i, :, prefix_len:prefix_len + length_i, :] 
+            seq_out = output[i, :, :length_i, :] 
             # permute => [length_i, H, D]
             seq_out = seq_out.movedim(0, 1)
             final_out.append(seq_out)
@@ -435,149 +436,7 @@ class CuDNNBackend():
         print(f"Graph Construction Time: {build_graph_time-start_time}")
         print(f"Forward Time: {end_time-build_graph_time}")
 
-        output = final_output
         return final_output
-
-    def _run_sdpa_forward_extend_ragged(
-        self,
-        query: torch.Tensor,
-        output: torch.Tensor,
-        k_cache: torch.Tensor,
-        v_cache: torch.Tensor,
-        req_to_token: torch.Tensor,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        extend_prefix_lens: torch.Tensor,
-        extend_seq_lens: torch.Tensor,
-        scaling=None,
-        enable_gqa=False,
-        causal=False,
-    ):
-        """Run the extend forward by using torch native sdpa op.
-
-        Args:
-            query: [num_tokens, num_heads, head_size]
-            output: [num_tokens, num_heads, head_size]
-            k_cache: [max_total_num_tokens, num_heads, head_size]
-            v_cache: [max_total_num_tokens, num_heads, head_size]
-            req_to_token: [max_num_reqs, max_context_len]
-            req_pool_indices: [num_seqs]
-            seq_lens: [num_seqs]
-            extend_prefix_lens: [num_seqs]
-            extend_seq_lens: [num_seqs]
-            scaling: float or None
-            enable_gqa: bool
-            causal: bool
-
-        Returns:
-            output: [num_tokens, num_heads, head_size]
-        """
-        assert seq_lens.shape[0] == extend_prefix_lens.shape[0]
-        assert seq_lens.shape[0] == extend_seq_lens.shape[0]
-
-
-        start_time = time.perf_counter()
-
-        B = seq_lens.shape[0]
-        
-        total_tokens = query.shape[0]
-
-        assert total_tokens == extend_seq_lens.sum(), (
-            f"query.shape[0] = {query.shape[0]}, but sum(extend_seq_lens) = {extend_seq_lens.sum()}"
-        )
-        
-        assert B == extend_seq_lens.shape[0], (
-            f"batch size must be the same, but got {B} and {extend_seq_lens.shape[0]}"
-        )
-
-        assert B == extend_prefix_lens.shape[0], (
-            f"batch size must be the same, but got {B} and {extend_prefix_lens.shape[0]}"
-        )
-
-        # q ragged offset is cumulative sequence length
-        q_ragged_offset = torch.zeros((B + 1, 1, 1, 1), dtype=torch.int32).cuda()
-        q_ragged_offset[1:, 0, 0, 0] = extend_seq_lens.cumsum(dim=0)
-        
-        # 1) Reshape the multi-token query to [B, max_new_tokens, H, D] in a padded fashion
-        H = query.shape[1]
-        D = query.shape[2]
-
-        prefill_graphs_for_batch_size = self._prefill_graphs[B-1]
-        for i, (tensor_args, graph) in enumerate(prefill_graphs_for_batch_size):
-            if (i + 1) * self._extend_seq_len_interval >= total_tokens:
-                break
-        tensor_args, graph = prefill_graphs_for_batch_size[i]
-        pad_size = (i + 1) * self._extend_seq_len_interval
-
-        # padded query: [pad_size, H, D]
-        padded_query = query.new_empty((pad_size, H, D))
-
-        # pad the query to pad_size
-        padded_query[:total_tokens,:,:] = query
-
-
-        # query contains num_tokens queries batched togather
-        q_gpu = padded_query
-
-        # heads, tokens, head size
-        # The tokens of queries are indexed by req_to_token
-        s, h, d = k_cache.shape
-        # Block Size of Paged Cache, 1 since only one token per block
-        b = 1
-
-
-        container_k_gpu = k_cache.view(s,h,b,d)
-        print('cache shape: ',container_k_gpu.shape)
-        container_v_gpu = v_cache.view(s,h,b,d)
-
-
-        per_req_tokens = req_to_token[req_pool_indices, :]
-        # reshape to [B, 1, max_ctx_len, 1]
-        page_table_k_gpu = per_req_tokens.view(per_req_tokens.shape[0],1,per_req_tokens.shape[1],1)
-        print("paged table k shape: ",page_table_k_gpu.shape)
-        page_table_v_gpu = per_req_tokens.view(per_req_tokens.shape[0],1,per_req_tokens.shape[1],1)
-        print("page table v shape: ",page_table_v_gpu.shape)
-
-        # 5) Sequence lengths
-        extend_prefix_lens_list = extend_prefix_lens.tolist()
-        seq_lens_kv = (extend_prefix_lens + extend_seq_lens).view(B, 1, 1, 1)
-        seq_lens_q = extend_seq_lens.view(B, 1, 1, 1)
-
-
-        # 7) Set output tensor
-        # CuDNN output will also be [B, H, max_new_tokens, D]
-        # eventually flatten it back to [sum_of_new_tokens_across_batch, H, D]
-        
-        #output = output.view(*padded_query.shape)
-        B_out, H_out, S_out, D_out = padded_query.shape
-        output = output.new_zeros((B_out, H_out, S_out, D_out))
-
-        build_graph_time = time.perf_counter()
-
-        variable_pack = {
-            tensor_args[self._ArgMapKeys.q]: q_gpu,
-            tensor_args[self._ArgMapKeys.q_ragged_offset]: q_ragged_offset,
-            tensor_args[self._ArgMapKeys.k_container]: container_k_gpu,
-            tensor_args[self._ArgMapKeys.v_container]: container_v_gpu,
-            tensor_args[self._ArgMapKeys.k_page_table]: page_table_k_gpu,
-            tensor_args[self._ArgMapKeys.v_page_table]: page_table_v_gpu,  
-            tensor_args[self._ArgMapKeys.seq_len_q_tensor_info]: seq_lens_q,
-            tensor_args[self._ArgMapKeys.seq_len_kv_tensor_info]: seq_lens_kv,
-            tensor_args[self._ArgMapKeys.o]: output,
-        }
-
-
-        workspace = torch.empty(graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
-        graph.execute(variable_pack, workspace)
-        print("CuDNN Output Shape: ",output.shape)
-
-        end_time = time.perf_counter()
-
-        print(f"Graph Construction Time: {build_graph_time-start_time}")
-        print(f"Forward Time: {end_time-build_graph_time}")
-
-        return output
-
 
     def _run_sdpa_forward_decode(
         self,
@@ -913,8 +772,8 @@ class TorchNativeAttnBackend():
 def test_correctness(test_decode = False, test_extend = True):
     input_parem = InputParameters()
     print("Input Parameters: ", json.dumps(dataclasses.asdict(input_parem), indent=4))
-    cudnn_bknd = CuDNNBackend(None,input_shape_parems=input_parem)
-    torch_native_backend = TorchNativeAttnBackend()
+    # cudnn_bknd = CuDNNBackend(None,input_shape_parems=input_parem)
+    # torch_native_backend = TorchNativeAttnBackend()
 
 
     # TODO: dtype
@@ -981,22 +840,41 @@ def test_correctness(test_decode = False, test_extend = True):
     if test_extend:
     # Force sum(extend_seq_lens) = input_parem.num_token
 
-        extend_seq_lens = 3*torch.randint(low=1, high=2, size=(input_parem.num_seqs,)).cuda()
-        print("Extend seq lens: ",extend_seq_lens.tolist())
-        input_parem.num_token = sum(extend_seq_lens)
-        print("Output Size should be: ",input_parem.num_token)
-        extend_prefix_lens = torch.zeros(size=[input_parem.num_seqs],dtype=torch.int32).cuda()
-        print("Extend prefix lens: ",extend_prefix_lens.tolist())
-        seq_lens = (extend_prefix_lens + extend_seq_lens).cuda()
-        req_to_token = torch.randint(low=0,high=input_parem.num_token,size=[input_parem.max_num_reqs, input_parem.max_context_lenght],dtype=torch.int32).cuda()
+        input_parem = InputParameters()
+        cudnn_bknd = CuDNNBackend(None,input_shape_parems=input_parem)
+        torch_native_backend = TorchNativeAttnBackend()
 
+        vals = torch.randint(low=1, high=6, size=(input_parem.num_seqs,))
+        input_parem.num_token = sum(vals)
+        # TODO: dtype
         query = torch.randn([input_parem.num_token, input_parem.num_heads, input_parem.head_size]).half().cuda()
         output = torch.randn([input_parem.num_token, input_parem.num_heads, input_parem.head_size]).half().cuda()
+        k_cache = torch.randn([input_parem.max_total_num_tokens, input_parem.num_heads, input_parem.head_size]).half().cuda()
+        v_cache = torch.randn([input_parem.max_total_num_tokens, input_parem.num_heads, input_parem.head_size]).half().cuda()
+
+        # the following are int tensors
+
+        # the request index of inputs sequences in req_to_token
+        req_pool_indices = torch.randint(low=0,high=input_parem.max_num_reqs,size=[input_parem.num_seqs],dtype=torch.int32).cuda()
+
+        extend_prefix_lens = torch.randint(low=0,high=5,size=[input_parem.num_seqs],dtype=torch.int32).cuda()
+        
+        extend_seq_lens = torch.tensor(vals, dtype=torch.int32).cuda()
+
+        # req_to_token[request_index]: list of index of tokens in query and value for that request_index
+        # sum(len(tokens_per_request)) = num_tokens in query
+        req_to_token = torch.randint(low=0,high=input_parem.num_token,size=[input_parem.max_num_reqs, input_parem.max_context_lenght],dtype=torch.int32).cuda()
+        # seq_lens = torch.randint(low=0,high=input_parem.max_total_num_tokens,size=[input_parem.num_seqs]).cuda()
+        seq_lens = (extend_prefix_lens + extend_seq_lens).cuda()
+        scaling = 1/math.sqrt(input_parem.head_size)
 
 
-        # current_sum = extend_seq_lens.sum()
-        # diff = input_parem.num_token - current_sum
-        # extend_seq_lens[0] += diff
+        logging.info("Start Extend Test")
+
+        # Force sum(extend_seq_lens) = input_parem.num_token
+        current_sum = extend_seq_lens.sum()
+        diff = input_parem.num_token - current_sum
+        extend_seq_lens[0] += diff
         assert extend_seq_lens.sum() == input_parem.num_token, \
             "extend_seq_lens sum doesn't match input_parem.num_token."
 
@@ -1032,7 +910,6 @@ def test_correctness(test_decode = False, test_extend = True):
             extend_prefix_lens=extend_prefix_lens,
             extend_seq_lens=extend_seq_lens,
             scaling=scaling,
-            causal=True,
         )
         torch.cuda.synchronize()
         print(f"[Torch Native] Peak memory: {torch.cuda.max_memory_allocated() / 1024 / 1024:.2f} MB")
@@ -1041,13 +918,6 @@ def test_correctness(test_decode = False, test_extend = True):
         print("Extend output shapes:", output.shape, torch_output.shape)
         output = output.squeeze()
         torch_output = torch_output.squeeze()
-        seq_len = torch_output.shape[0]
-        equal_locs =  []
-        for i in range(seq_len):
-            if output[i,:,:].equal(torch_output[i,:,:]):
-                equal_locs.append(i)
-        print("Equal locations: ",equal_locs)
-
         torch.testing.assert_close(output,torch_output)
         print("Extend Result Same")
 
