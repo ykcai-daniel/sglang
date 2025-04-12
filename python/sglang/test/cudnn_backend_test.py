@@ -364,25 +364,32 @@ class CuDNNBackend():
         page_table_k = graph.tensor_like(page_table_k_gpu)
         page_table_v = graph.tensor_like(page_table_v_gpu)
 
-
+        # check all prefix len are the same
+        assert (extend_prefix_lens[0] == extend_prefix_lens[1:]).all(), (
+            f"Only support same prefix length for all sequences in a batch {extend_prefix_lens}"
+        )
+        padding_mask_offset = extend_prefix_lens[0].item()
 
         # 6) Build the SDPA operation
-        o, _ = graph.sdpa(
+        o, stat = graph.sdpa(
             name="sdpa",
             q=q,
             k=container_k,  # Container K: non contiguous container with K blocks
             v=container_v,  # Container V: non contiguous container with V blocks
             is_inference=True,
             attn_scale=1/math.sqrt(self.input_size_params.head_size),
-            use_causal_mask=False,
+            use_causal_mask=True,
             use_padding_mask=True,
+            diagonal_band_right_bound=padding_mask_offset,
             seq_len_q=seq_len_q_tensor_info,
             seq_len_kv=seq_len_kv_tensor_info,
             paged_attention_k_table=page_table_k,  # Page Table K: Tensor containing offsets to the container with K blocks
             paged_attention_v_table=page_table_v,  # Page Table V: Tensor containing offsets to the container with V blocks
             paged_attention_max_seq_len_kv=max_ctx_len,  # The maximum sequence length for K caches (this is optional, but recommended)
         )
+        print(stat)
         logging.info(graph)
+
 
         # 7) Set output tensor
         # CuDNN output will also be [B, H, max_new_tokens, D]
@@ -857,7 +864,8 @@ def test_correctness(test_decode = False, test_extend = True):
         # the request index of inputs sequences in req_to_token
         req_pool_indices = torch.randint(low=0,high=input_parem.max_num_reqs,size=[input_parem.num_seqs],dtype=torch.int32).cuda()
 
-        extend_prefix_lens = torch.randint(low=0,high=5,size=[input_parem.num_seqs],dtype=torch.int32).cuda()
+        extend_prefix_len = 3
+        extend_prefix_lens = extend_prefix_len * torch.ones(size=[input_parem.num_seqs],dtype=torch.int32).cuda()
         
         extend_seq_lens = torch.tensor(vals, dtype=torch.int32).cuda()
 
@@ -910,6 +918,7 @@ def test_correctness(test_decode = False, test_extend = True):
             extend_prefix_lens=extend_prefix_lens,
             extend_seq_lens=extend_seq_lens,
             scaling=scaling,
+            causal=True,
         )
         torch.cuda.synchronize()
         print(f"[Torch Native] Peak memory: {torch.cuda.max_memory_allocated() / 1024 / 1024:.2f} MB")
