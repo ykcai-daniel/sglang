@@ -293,11 +293,12 @@ class CuDNNBackend():
         padded_query = query.new_zeros((B, max_new_tokens, H, D))
 
         # Fill in each sequence's slice
+
         offset = 0
         for i in range(B):
             length_i = extend_seq_lens[i].item()
             prefix_i = extend_prefix_lens[i].item()
-            padded_query[i, :length_i, :, :] = query[offset : offset + length_i, :, :]
+            padded_query[i, prefix_i:prefix_i+length_i, :, :] = query[offset : offset + length_i, :, :]
             offset += length_i
 
         # [B, H, max_new_tokens, D]
@@ -334,8 +335,8 @@ class CuDNNBackend():
         container_v = graph.tensor_like(container_v_gpu)
 
         # 4) Sequence lengths
-        seq_lens_kv = (extend_prefix_lens + extend_seq_lens).view(B, 1, 1, 1)
-        seq_lens_q = extend_seq_lens.view(B, 1, 1, 1)
+        seq_lens_kv = seq_lens.view(B, 1, 1, 1)
+        seq_lens_q = (extend_prefix_lens+extend_seq_lens).view(B, 1, 1, 1)
 
         seq_len_q_tensor_info = graph.tensor_like(seq_lens_q)
         seq_len_kv_tensor_info = graph.tensor_like(seq_lens_kv)
@@ -364,11 +365,12 @@ class CuDNNBackend():
         page_table_k = graph.tensor_like(page_table_k_gpu)
         page_table_v = graph.tensor_like(page_table_v_gpu)
 
+
         # check all prefix len are the same
-        assert (extend_prefix_lens[0] == extend_prefix_lens[1:]).all(), (
-            f"Only support same prefix length for all sequences in a batch {extend_prefix_lens}"
-        )
-        padding_mask_offset = extend_prefix_lens[0].item()
+        # assert (extend_prefix_lens[0] == extend_prefix_lens[1:]).all(), (
+        #     f"Only support same prefix length for all sequences in a batch {extend_prefix_lens}"
+        # )
+        # padding_mask_offset = extend_prefix_lens[0].item()
 
         # 6) Build the SDPA operation
         o, stat = graph.sdpa(
@@ -380,7 +382,10 @@ class CuDNNBackend():
             attn_scale=1/math.sqrt(self.input_size_params.head_size),
             use_causal_mask=True,
             use_padding_mask=True,
-            diagonal_band_right_bound=padding_mask_offset,
+            # instead of using causal mask right bound, we can also pad the query starting from prefix_len
+            # This approach no longer needs diagonal_band_right_bound arg below
+            # but is result in more memory usage and is against chunked prefilling
+            #diagonal_band_right_bound=padding_mask_offset,
             seq_len_q=seq_len_q_tensor_info,
             seq_len_kv=seq_len_kv_tensor_info,
             paged_attention_k_table=page_table_k,  # Page Table K: Tensor containing offsets to the container with K blocks
@@ -433,7 +438,8 @@ class CuDNNBackend():
         offset = 0
         for i in range(B):
             length_i = extend_seq_lens[i].item()
-            seq_out = output[i, :, :length_i, :] 
+            prefix_i = extend_prefix_lens[i].item()
+            seq_out = output[i, :, prefix_i:prefix_i+length_i, :] 
             # permute => [length_i, H, D]
             seq_out = seq_out.movedim(0, 1)
             final_out.append(seq_out)
@@ -864,8 +870,7 @@ def test_correctness(test_decode = False, test_extend = True):
         # the request index of inputs sequences in req_to_token
         req_pool_indices = torch.randint(low=0,high=input_parem.max_num_reqs,size=[input_parem.num_seqs],dtype=torch.int32).cuda()
 
-        extend_prefix_len = 3
-        extend_prefix_lens = extend_prefix_len * torch.ones(size=[input_parem.num_seqs],dtype=torch.int32).cuda()
+        extend_prefix_lens = torch.randint(low=0,high=4,size=[input_parem.num_seqs],dtype=torch.int32).cuda()
         
         extend_seq_lens = torch.tensor(vals, dtype=torch.int32).cuda()
 
