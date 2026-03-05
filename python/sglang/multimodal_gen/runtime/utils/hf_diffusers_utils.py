@@ -644,7 +644,9 @@ def maybe_download_model(
     Check if the model path is a Hugging Face Hub model ID and download it if needed.
 
     Args:
-        model_name_or_path: Local path or Hugging Face Hub model ID
+        model_name_or_path: Local path or Hugging Face Hub model ID. Supports
+            "repo_id::filename" syntax to download a single file from a repo
+            (e.g. "black-forest-labs/FLUX.2-dev-NVFP4::flux2-dev-nvfp4-mixed.safetensors").
         local_dir: Local directory to save the model
         download: Whether to download the model from Hugging Face Hub
         is_lora: If True, skip model completeness verification (LoRA models don't have transformer/vae directories)
@@ -652,6 +654,36 @@ def maybe_download_model(
     Returns:
         Local path to the model
     """
+
+    # Handle "hf://namespace/repo/filename" format: download a single file from a HF repo.
+    # repo_id is always "namespace/repo" (2 components), remainder is the filename.
+    if model_name_or_path.startswith("hf://"):
+        parts = model_name_or_path[len("hf://"):].split("/", 2)
+        if len(parts) != 3:
+            raise ValueError(
+                f"Invalid hf:// path '{model_name_or_path}'. "
+                "Expected format: hf://namespace/repo/filename"
+            )
+        repo_id = f"{parts[0]}/{parts[1]}"
+        filename = parts[2]
+        # Cache-first: try local_files_only before hitting the network.
+        try:
+            local_path = hf_hub_download(
+                repo_id, filename, local_dir=local_dir, local_files_only=True
+            )
+            logger.info("Found %s in cache at %s", filename, local_path)
+            return str(local_path)
+        except Exception:
+            pass
+        if not download:
+            raise ValueError(
+                f"File '{filename}' from repo '{repo_id}' not found in cache "
+                "and download=False."
+            )
+        logger.info("Downloading %s from %s...", filename, repo_id)
+        local_path = hf_hub_download(repo_id, filename, local_dir=local_dir)
+        logger.info("Downloaded %s to %s", filename, local_path)
+        return str(local_path)
 
     # 1. Local path check: if path exists locally, verify it's complete (skip for LoRA)
     if os.path.exists(model_name_or_path):
@@ -908,6 +940,60 @@ def get_metadata_from_safetensors_file(file_path: str):
         logger.warning(e)
 
 
+def _bfl_to_diffusers_module_name(bfl_name: str) -> Optional[list[str]]:
+    """Translate a BFL-format weight prefix to its diffusers-format equivalent(s).
+
+    Returns a list of translated model parameter prefixes, or None if the prefix
+    corresponds to a non-linear layer (e.g. RMSNorm scale) that should not appear
+    in exclude_modules.  Packed QKV prefixes expand to multiple separate names.
+    Unrecognised prefixes are assumed to already be in diffusers format.
+    """
+    import re
+
+    # BFL block-level patterns that map to one or more diffusers linear names.
+    # A list[str] replacement means the BFL weight is packed and maps to several
+    # separate model layers (i.e. separate Q/K/V projections).
+    _LINEAR_PATTERNS = [
+        (
+            r"^double_blocks\.(\d+)\.img_attn\.qkv$",
+            [r"transformer_blocks.\1.attn.to_q", r"transformer_blocks.\1.attn.to_k", r"transformer_blocks.\1.attn.to_v"],
+        ),
+        (r"^double_blocks\.(\d+)\.img_attn\.proj$", r"transformer_blocks.\1.attn.to_out.0"),
+        (
+            r"^double_blocks\.(\d+)\.txt_attn\.qkv$",
+            [r"transformer_blocks.\1.attn.add_q_proj", r"transformer_blocks.\1.attn.add_k_proj", r"transformer_blocks.\1.attn.add_v_proj"],
+        ),
+        (r"^double_blocks\.(\d+)\.txt_attn\.proj$", r"transformer_blocks.\1.attn.to_add_out"),
+        (r"^double_blocks\.(\d+)\.img_mlp\.0$", r"transformer_blocks.\1.ff.linear_in"),
+        (r"^double_blocks\.(\d+)\.img_mlp\.2$", r"transformer_blocks.\1.ff.linear_out"),
+        (r"^double_blocks\.(\d+)\.txt_mlp\.0$", r"transformer_blocks.\1.ff_context.linear_in"),
+        (r"^double_blocks\.(\d+)\.txt_mlp\.2$", r"transformer_blocks.\1.ff_context.linear_out"),
+        (r"^single_blocks\.(\d+)\.linear1$", r"single_transformer_blocks.\1.attn.to_qkv_mlp_proj"),
+        (r"^single_blocks\.(\d+)\.linear2$", r"single_transformer_blocks.\1.attn.to_out"),
+        # Non-block BFL linear that has quant_config in the model: map to model param name
+        (r"^final_layer\.linear$", r"proj_out"),
+    ]
+    for pattern, replacement in _LINEAR_PATTERNS:
+        if re.match(pattern, bfl_name):
+            if isinstance(replacement, list):
+                return [re.sub(pattern, r, bfl_name) for r in replacement]
+            return [re.sub(pattern, replacement, bfl_name)]
+
+    # BFL block-level norm patterns — not linear layers, skip them
+    _NORM_PATTERNS = [
+        r"^double_blocks\.\d+\.img_attn\.norm\.",
+        r"^double_blocks\.\d+\.txt_attn\.norm\.",
+        r"^single_blocks\.\d+\.norm\.",
+    ]
+    for pattern in _NORM_PATTERNS:
+        if re.match(pattern, bfl_name):
+            return None
+
+    # Anything else is assumed to already use diffusers naming (e.g. x_embedder,
+    # context_embedder, proj_out, modulation layers).
+    return [bfl_name]
+
+
 def get_quant_config_from_safetensors_metadata(
     file_path: str,
 ) -> Optional[QuantizationConfig]:
@@ -926,17 +1012,47 @@ def get_quant_config_from_safetensors_metadata(
     except Exception as _e:
         return None
 
-    # handle diffusers fp8 safetensors metadata format
+    # handle diffusers fp8/nvfp4 safetensors metadata format:
+    # {"format_version": "1.0", "layers": {"layer_name": {"format": "nvfp4"|"float8"}, ...}}
     if (
         "quant_method" not in quant_config_dict
         and "format_version" in quant_config_dict
         and "layers" in quant_config_dict
     ):
         layers = quant_config_dict.get("layers", {})
-        if any(
-            isinstance(v, dict) and "float8" in v.get("format", "")
-            for v in layers.values()
-        ):
+        formats = {
+            v.get("format", "") for v in layers.values() if isinstance(v, dict)
+        }
+        if any("nvfp4" in fmt for fmt in formats):
+            # Derive exclude_modules: linear layers present in the file but NOT
+            # listed as quantized (i.e. kept in BF16 for the mixed checkpoint).
+            try:
+                with safe_open(file_path, framework="pt", device="cpu") as f:
+                    tensor_keys = set(f.keys())
+            except Exception:
+                tensor_keys = set()
+            fp4_prefixes = set(layers.keys())
+            all_weight_prefixes = {
+                k[: -len(".weight")]
+                for k in tensor_keys
+                if k.endswith(".weight")
+            }
+            # Translate BFL-format non-FP4 prefixes to diffusers-format names so
+            # that ModelOptFp4Config.is_layer_excluded() can match them against
+            # the model's parameter prefixes.  Packed QKV prefixes expand to
+            # multiple separate names (to_q / to_k / to_v), so we flatten.
+            exclude_modules = sorted(
+                {
+                    diffusers_name
+                    for name in all_weight_prefixes - fp4_prefixes
+                    for diffusers_name in (_bfl_to_diffusers_module_name(name) or [])
+                }
+            )
+            quant_config_dict["quant_method"] = "modelopt_fp4"
+            quant_config_dict["quant_algo"] = "NVFP4"
+            quant_config_dict["group_size"] = 16
+            quant_config_dict["ignore"] = exclude_modules
+        elif any("float8" in fmt for fmt in formats):
             quant_config_dict["quant_method"] = "fp8"
             quant_config_dict["activation_scheme"] = "dynamic"
 

@@ -11,8 +11,9 @@ import sglang.multimodal_gen.envs as envs
 from sglang.multimodal_gen.runtime.layers.linear import (
     LinearMethodBase,
     UnquantizedLinearMethod,
+    
 )
-from sglang.multimodal_gen.runtime.layers.quantization.base_config import (
+from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
@@ -25,7 +26,7 @@ from sglang.srt.layers.quantization.utils import is_layer_skipped, swizzle_block
 from sglang.srt.utils.custom_op import register_custom_op
 
 try:
-    if current_platform.is_sm120():
+    if current_platform.is_sm120() or current_platform.is_blackwell():
         from flashinfer import fp4_quantize
     else:
         from sgl_kernel import scaled_fp4_quant as fp4_quantize
@@ -106,7 +107,7 @@ class ModelOptQuantConfig(QuantizationConfig):
         packed_modules_mapping: Optional[Dict[str, List[str]]],
     ):
         super().__init__()
-        self.packed_modules_mapping = packed_modules_mapping
+        self.packed_modules_mapping = packed_modules_mapping or {}
         self.exclude_modules = exclude_modules or []
 
     def _get_quant_method(
@@ -119,9 +120,7 @@ class ModelOptQuantConfig(QuantizationConfig):
         from sglang.multimodal_gen.runtime.layers.linear import LinearBase
 
         if isinstance(layer, LinearBase):
-            if is_layer_skipped(
-                prefix, self.exclude_modules, self.packed_modules_mapping
-            ) or self.is_layer_excluded(prefix):
+            if self.is_layer_excluded(prefix):
                 return UnquantizedLinearMethod()
             return Linear(self)
         return None
@@ -368,7 +367,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         layer.register_parameter("weight", weight)
 
         input_scale = PerTensorScaleParameter(
-            data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
+            data=torch.ones(len(output_partition_sizes), dtype=torch.float32),
             weight_loader=weight_loader,
         )
 
@@ -439,9 +438,12 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         output_dtype = x.dtype
+        # Support arbitrary leading batch dimensions (e.g. [B, S, K] or [M, K])
+        input_shape = x.shape
+        x = x.view(-1, input_shape[-1])
         x_m, _ = x.shape
-        w_n, _ = layer.weight.shape
-        output_shape = [x_m, w_n]
+        w_n = layer.weight.shape[0]
+        output_shape = list(input_shape[:-1]) + [w_n]
 
         # Quantize BF16 or FP16 to (FP4 and interleaved block scale)
         x_fp4, x_scale_interleaved = fp4_quantize(x, layer.input_scale_inv)

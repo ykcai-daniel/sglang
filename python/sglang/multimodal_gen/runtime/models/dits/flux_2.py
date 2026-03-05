@@ -80,6 +80,7 @@ class Flux2FeedForward(nn.Module):
         inner_dim: Optional[int] = None,
         bias: bool = False,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
         if inner_dim is None:
@@ -88,11 +89,13 @@ class Flux2FeedForward(nn.Module):
 
         # Flux2SwiGLU will reduce the dimension by half
         self.linear_in = ColumnParallelLinear(
-            dim, inner_dim * 2, bias=bias, gather_output=True, quant_config=quant_config
+            dim, inner_dim * 2, bias=bias, gather_output=True, quant_config=quant_config,
+            prefix=f"{prefix}.linear_in" if prefix else "linear_in",
         )
         self.act_fn = Flux2SwiGLU()
         self.linear_out = ColumnParallelLinear(
-            inner_dim, dim_out, bias=bias, gather_output=True, quant_config=quant_config
+            inner_dim, dim_out, bias=bias, gather_output=True, quant_config=quant_config,
+            prefix=f"{prefix}.linear_out" if prefix else "linear_out",
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -117,6 +120,7 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
         out_dim: int = None,
         elementwise_affine: bool = True,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
 
@@ -138,6 +142,7 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
             bias=bias,
             gather_output=True,
             quant_config=quant_config,
+            prefix=f"{prefix}.to_q" if prefix else "to_q",
         )
         self.to_k = ColumnParallelLinear(
             query_dim,
@@ -145,6 +150,7 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
             bias=bias,
             gather_output=True,
             quant_config=quant_config,
+            prefix=f"{prefix}.to_k" if prefix else "to_k",
         )
         self.to_v = ColumnParallelLinear(
             query_dim,
@@ -152,6 +158,7 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
             bias=bias,
             gather_output=True,
             quant_config=quant_config,
+            prefix=f"{prefix}.to_v" if prefix else "to_v",
         )
 
         # QK Norm
@@ -166,6 +173,7 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
                 bias=out_bias,
                 gather_output=True,
                 quant_config=quant_config,
+                prefix=f"{prefix}.to_out.0" if prefix else "to_out.0",
             )
         )
         self.to_out.append(torch.nn.Dropout(dropout))
@@ -179,6 +187,7 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
                 bias=added_proj_bias,
                 gather_output=True,
                 quant_config=quant_config,
+                prefix=f"{prefix}.add_q_proj" if prefix else "add_q_proj",
             )
             self.add_k_proj = ColumnParallelLinear(
                 added_kv_proj_dim,
@@ -186,6 +195,7 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
                 bias=added_proj_bias,
                 gather_output=True,
                 quant_config=quant_config,
+                prefix=f"{prefix}.add_k_proj" if prefix else "add_k_proj",
             )
             self.add_v_proj = ColumnParallelLinear(
                 added_kv_proj_dim,
@@ -193,6 +203,7 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
                 bias=added_proj_bias,
                 gather_output=True,
                 quant_config=quant_config,
+                prefix=f"{prefix}.add_v_proj" if prefix else "add_v_proj",
             )
             self.to_add_out = ColumnParallelLinear(
                 self.inner_dim,
@@ -200,6 +211,7 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
                 bias=out_bias,
                 gather_output=True,
                 quant_config=quant_config,
+                prefix=f"{prefix}.to_add_out" if prefix else "to_add_out",
             )
 
         self.attn = USPAttention(
@@ -314,6 +326,7 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
         mlp_ratio: float = 4.0,
         mlp_mult_factor: int = 2,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
 
@@ -337,6 +350,7 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
             bias=bias,
             gather_output=True,
             quant_config=quant_config,
+            prefix=f"{prefix}.to_qkv_mlp_proj" if prefix else "to_qkv_mlp_proj",
         )
         self.mlp_act_fn = Flux2SwiGLU()
 
@@ -351,6 +365,7 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
             bias=out_bias,
             gather_output=True,
             quant_config=quant_config,
+            prefix=f"{prefix}.to_out" if prefix else "to_out",
         )
 
         self.attn = USPAttention(
@@ -422,6 +437,7 @@ class Flux2SingleTransformerBlock(nn.Module):
         eps: float = 1e-6,
         bias: bool = False,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
 
@@ -441,6 +457,7 @@ class Flux2SingleTransformerBlock(nn.Module):
             mlp_ratio=mlp_ratio,
             mlp_mult_factor=2,
             quant_config=quant_config,
+            prefix=f"{prefix}.attn" if prefix else "attn",
         )
 
     def forward(
@@ -495,6 +512,7 @@ class Flux2TransformerBlock(nn.Module):
         eps: float = 1e-6,
         bias: bool = False,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.mlp_hidden_dim = int(dim * mlp_ratio)
@@ -513,16 +531,19 @@ class Flux2TransformerBlock(nn.Module):
             out_bias=bias,
             eps=eps,
             quant_config=quant_config,
+            prefix=f"{prefix}.attn" if prefix else "attn",
         )
 
         self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
         self.ff = Flux2FeedForward(
-            dim=dim, dim_out=dim, mult=mlp_ratio, bias=bias, quant_config=quant_config
+            dim=dim, dim_out=dim, mult=mlp_ratio, bias=bias, quant_config=quant_config,
+            prefix=f"{prefix}.ff" if prefix else "ff",
         )
 
         self.norm2_context = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
         self.ff_context = Flux2FeedForward(
-            dim=dim, dim_out=dim, mult=mlp_ratio, bias=bias, quant_config=quant_config
+            dim=dim, dim_out=dim, mult=mlp_ratio, bias=bias, quant_config=quant_config,
+            prefix=f"{prefix}.ff_context" if prefix else "ff_context",
         )
 
     def forward(
@@ -724,7 +745,7 @@ class Flux2Transformer2DModel(CachableDiT, OffloadableDiTMixin):
         self.out_channels = out_channels or in_channels
         self.inner_dim = num_attention_heads * attention_head_dim
         self.guidance_embeds = guidance_embeds
-        quant_config = config.quant_config
+        quant_config = quant_config if quant_config is not None else config.quant_config
 
         # 1. Sinusoidal positional embedding for RoPE on image and text tokens
         self.rotary_emb = Flux2PosEmbed(theta=rope_theta, axes_dim=axes_dims_rope)
@@ -769,8 +790,9 @@ class Flux2Transformer2DModel(CachableDiT, OffloadableDiTMixin):
                     eps=eps,
                     bias=False,
                     quant_config=quant_config,
+                    prefix=f"transformer_blocks.{i}",
                 )
-                for _ in range(num_layers)
+                for i in range(num_layers)
             ]
         )
 
@@ -785,8 +807,9 @@ class Flux2Transformer2DModel(CachableDiT, OffloadableDiTMixin):
                     eps=eps,
                     bias=False,
                     quant_config=quant_config,
+                    prefix=f"single_transformer_blocks.{i}",
                 )
-                for _ in range(num_single_layers)
+                for i in range(num_single_layers)
             ]
         )
 
@@ -804,6 +827,7 @@ class Flux2Transformer2DModel(CachableDiT, OffloadableDiTMixin):
             bias=False,
             gather_output=True,
             quant_config=quant_config,
+            prefix="proj_out",
         )
 
         self.layer_names = ["transformer_blocks", "single_transformer_blocks"]

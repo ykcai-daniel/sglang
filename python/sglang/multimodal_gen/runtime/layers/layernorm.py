@@ -496,8 +496,8 @@ def apply_qk_norm(
         and can_use_fused_inplace_qknorm(head_dim, q.dtype)
     ):
         fused_inplace_qknorm(
-            q=q.view(batch_size, -1, head_dim),
-            k=k.view(batch_size, -1, head_dim),
+            q=q.reshape(batch_size, -1, head_dim),
+            k=k.reshape(batch_size, -1, head_dim),
             q_weight=q_norm.weight,
             k_weight=k_norm.weight,
             head_dim=head_dim,

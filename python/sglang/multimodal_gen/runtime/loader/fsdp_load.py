@@ -306,7 +306,14 @@ def load_model_from_full_model_state_dict(
                 ):
                     requires_grad = False
                 temp_param.requires_grad = requires_grad
-                weight_loader(temp_param, full_tensor)
+                try:
+                    weight_loader(temp_param, full_tensor)
+                except AssertionError:
+                    raise AssertionError(
+                        f"Shape mismatch loading '{target_param_name}': "
+                        f"param={temp_param.data.shape} dtype={temp_param.data.dtype}, "
+                        f"checkpoint={full_tensor.shape} dtype={full_tensor.dtype}"
+                    )
                 sharded_tensor = temp_param.data
             else:
                 # In cases where parts of the model aren't sharded, some parameters will be plain tensors
@@ -367,9 +374,17 @@ def load_model_from_full_model_state_dict(
         "wtscale",
         "bias",
     ]
+    # Scales missing from checkpoint are initialized to 1.0 (multiplicative identity)
+    ONES_INIT_PATTERNS = [
+        "wcscales",
+        "wtscale",
+        "input_scale",
+        "weight_scale_2",
+    ]
     for new_param_name in unused_keys:
         # check unallowed missing params
-        if not any(pattern in new_param_name for pattern in ALLOWED_NEW_PARAM_PATTERNS):
+        if not any(pattern in new_param_name for pattern in ALLOWED_NEW_PARAM_PATTERNS) and \
+           not any(pattern in new_param_name for pattern in ONES_INIT_PATTERNS):
             logger.error(
                 "Unsupported new parameter: %s. Allowed patterns: %s",
                 new_param_name,
@@ -383,7 +398,7 @@ def load_model_from_full_model_state_dict(
         meta_sharded_param = meta_sd.get(new_param_name)
         meta_sharded_param_dtype = meta_sharded_param.dtype
 
-        if "wcscales" in new_param_name or "wtscale" in new_param_name:
+        if any(pattern in new_param_name for pattern in ONES_INIT_PATTERNS):
             init_like = torch.ones_like
         else:
             init_like = torch.zeros_like
