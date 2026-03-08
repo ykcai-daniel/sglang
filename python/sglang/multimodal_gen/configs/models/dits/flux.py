@@ -18,7 +18,7 @@ class FluxArchConfig(DiTArchConfig):
     num_attention_heads: int = 24
     joint_attention_dim: int = 4096
     pooled_projection_dim: int = 768
-    guidance_embeds: bool = False
+    guidance_embeds: bool = True
     axes_dims_rope: Tuple[int, int, int] = (16, 56, 56)
 
     stacked_params_mapping: list[tuple[str, str, str]] = field(default_factory=list)
@@ -101,7 +101,7 @@ class FluxArchConfig(DiTArchConfig):
             ],
             # single_transformer_blocks nunchaku format (raw export - before internal conversion)
             r"^single_transformer_blocks\.(\d+)\.qkv_proj\.(.*)$": r"single_transformer_blocks.\1.attn.to_qkv_mlp_proj.\2",
-            r"^single_transformer_blocks\.(\d+)\.out_proj\.(.*)$": r"single_transformer_blocks.\1.attn.to_out.0.\2",
+            r"^single_transformer_blocks\.(\d+)\.out_proj\.(.*)$": r"single_transformer_blocks.\1.attn.to_out.\2",
             r"^single_transformer_blocks\.(\d+)\.norm_q\.(.*)$": r"single_transformer_blocks.\1.attn.norm_q.\2",
             r"^single_transformer_blocks\.(\d+)\.norm_k\.(.*)$": r"single_transformer_blocks.\1.attn.norm_k.\2",
             # nunchaku quantization parameter name conversions (apply to all blocks)

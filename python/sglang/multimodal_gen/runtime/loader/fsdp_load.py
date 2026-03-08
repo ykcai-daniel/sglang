@@ -294,6 +294,21 @@ def load_model_from_full_model_state_dict(
         else:
             target_dtype = meta_sharded_param.dtype
 
+        _QUANTIZED_DTYPES = (torch.uint8, torch.float8_e4m3fn, torch.float8_e5m2, torch.int8)
+        if full_tensor.dtype != target_dtype:
+            if full_tensor.dtype in _QUANTIZED_DTYPES or target_dtype in _QUANTIZED_DTYPES:
+                logger.error(
+                    "Dtype mismatch for quantized parameter %s: "
+                    "checkpoint has %s, model expects %s",
+                    target_param_name, full_tensor.dtype, target_dtype,
+                )
+            else:
+                logger.warning(
+                    "Dtype mismatch for %s: checkpoint has %s, model expects %s — casting",
+                    target_param_name, full_tensor.dtype, target_dtype,
+                )
+            raise Exception(f'dtype mismatch for {target_param_name}')
+
         if not hasattr(meta_sharded_param, "device_mesh"):
             full_tensor = full_tensor.to(device=device, dtype=target_dtype)
             actual_param = param_dict.get(target_param_name)
