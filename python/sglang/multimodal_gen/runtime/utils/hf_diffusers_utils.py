@@ -46,6 +46,9 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.environ import envs
 from sglang.utils import is_in_ci
+from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
+    QuantizationConfig,
+)
 
 logger = init_logger(__name__)
 

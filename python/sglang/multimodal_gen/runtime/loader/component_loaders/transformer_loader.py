@@ -26,6 +26,7 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import get_log_level, init_logger
 from sglang.multimodal_gen.runtime.utils.quantization_utils import (
+    build_nvfp4_config_from_safetensors,
     get_metadata_from_safetensors_file,
     get_quant_config,
     get_quant_config_from_safetensors_metadata,
@@ -92,6 +93,20 @@ class TransformerLoader(ComponentLoader):
                 )
                 if quant_config:
                     break
+
+            # Fallback: handle NVFP4 per-layer format metadata
+            # ({"format_version": ..., "layers": {"name": {"format": "nvfp4"}, ...}})
+            if quant_config is None:
+                dit_config = getattr(server_args.pipeline_config, "dit_config", None)
+                arch_config = getattr(dit_config, "arch_config", None)
+                param_names_mapping_dict = getattr(arch_config, "param_names_mapping", None)
+                for safetensors_file in safetensors_list:
+                    quant_config = build_nvfp4_config_from_safetensors(
+                        safetensors_file, param_names_mapping_dict
+                    )
+                    if quant_config:
+                        break
+
         return quant_config
 
     def _resolve_target_param_dtype(

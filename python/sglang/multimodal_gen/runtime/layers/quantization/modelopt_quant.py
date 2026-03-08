@@ -120,7 +120,9 @@ class ModelOptQuantConfig(QuantizationConfig):
         from sglang.multimodal_gen.runtime.layers.linear import LinearBase
 
         if isinstance(layer, LinearBase):
-            if self.is_layer_excluded(prefix):
+            if is_layer_skipped(
+                prefix, self.exclude_modules, self.packed_modules_mapping
+            ) or self.is_layer_excluded(prefix):
                 return UnquantizedLinearMethod()
             return Linear(self)
         return None
