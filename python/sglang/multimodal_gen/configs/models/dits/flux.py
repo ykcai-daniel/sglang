@@ -28,36 +28,28 @@ class FluxArchConfig(DiTArchConfig):
         default_factory=lambda: {
             # HF diffusers format: strip leading "transformer." prefix
             r"^transformer\.(\w*)\.(.*)$": r"\1.\2",
-            # BFL format: double blocks - image attention QKV (packed) → split into Q, K, V
-            r"^double_blocks\.(\d+)\.img_attn\.qkv\.(.*)$": [
-                r"transformer_blocks.\1.attn.to_q.\2",
-                r"transformer_blocks.\1.attn.to_k.\2",
-                r"transformer_blocks.\1.attn.to_v.\2",
-            ],
+            # FLUX2-nvfp4 format: double blocks - image attention QKV (packed, fused)
+            r"^double_blocks\.(\d+)\.img_attn\.qkv\.(.*)$": r"transformer_blocks.\1.attn.to_qkv.\2",
             r"^double_blocks\.(\d+)\.img_attn\.proj\.(.*)$": r"transformer_blocks.\1.attn.to_out.0.\2",
             r"^double_blocks\.(\d+)\.img_attn\.norm\.query_norm\.(.*)$": r"transformer_blocks.\1.attn.norm_q.\2",
             r"^double_blocks\.(\d+)\.img_attn\.norm\.key_norm\.(.*)$": r"transformer_blocks.\1.attn.norm_k.\2",
-            # BFL format: double blocks - text/context attention QKV (packed) → split into Q, K, V
-            r"^double_blocks\.(\d+)\.txt_attn\.qkv\.(.*)$": [
-                r"transformer_blocks.\1.attn.add_q_proj.\2",
-                r"transformer_blocks.\1.attn.add_k_proj.\2",
-                r"transformer_blocks.\1.attn.add_v_proj.\2",
-            ],
+            # FLUX2-nvfp4 format: double blocks - text/context attention QKV (packed, fused)
+            r"^double_blocks\.(\d+)\.txt_attn\.qkv\.(.*)$": r"transformer_blocks.\1.attn.to_added_qkv.\2",
             r"^double_blocks\.(\d+)\.txt_attn\.proj\.(.*)$": r"transformer_blocks.\1.attn.to_add_out.\2",
             r"^double_blocks\.(\d+)\.txt_attn\.norm\.query_norm\.(.*)$": r"transformer_blocks.\1.attn.norm_added_q.\2",
             r"^double_blocks\.(\d+)\.txt_attn\.norm\.key_norm\.(.*)$": r"transformer_blocks.\1.attn.norm_added_k.\2",
-            # BFL format: double blocks - image MLP
+            # FLUX2-nvfp4  format: double blocks - image MLP
             r"^double_blocks\.(\d+)\.img_mlp\.0\.(.*)$": r"transformer_blocks.\1.ff.linear_in.\2",
             r"^double_blocks\.(\d+)\.img_mlp\.2\.(.*)$": r"transformer_blocks.\1.ff.linear_out.\2",
-            # BFL format: double blocks - text/context MLP
+            # FLUX2-nvfp4  format: double blocks - text/context MLP
             r"^double_blocks\.(\d+)\.txt_mlp\.0\.(.*)$": r"transformer_blocks.\1.ff_context.linear_in.\2",
             r"^double_blocks\.(\d+)\.txt_mlp\.2\.(.*)$": r"transformer_blocks.\1.ff_context.linear_out.\2",
-            # BFL format: single blocks
+            # FLUX2-nvfp4  format: single blocks
             r"^single_blocks\.(\d+)\.linear1\.(.*)$": r"single_transformer_blocks.\1.attn.to_qkv_mlp_proj.\2",
             r"^single_blocks\.(\d+)\.linear2\.(.*)$": r"single_transformer_blocks.\1.attn.to_out.\2",
             r"^single_blocks\.(\d+)\.norm\.query_norm\.(.*)$": r"single_transformer_blocks.\1.attn.norm_q.\2",
             r"^single_blocks\.(\d+)\.norm\.key_norm\.(.*)$": r"single_transformer_blocks.\1.attn.norm_k.\2",
-            # BFL format: non-block input/output projections
+            # FLUX2-nvfp4  format: non-block input/output projections
             r"^img_in\.(.*)$": r"x_embedder.\1",
             r"^txt_in\.(.*)$": r"context_embedder.\1",
             r"^time_in\.in_layer\.(.*)$": r"time_guidance_embed.timestep_embedder.linear_1.\1",
@@ -69,36 +61,24 @@ class FluxArchConfig(DiTArchConfig):
             r"^single_stream_modulation\.lin\.(.*)$": r"single_stream_modulation.linear.\1",
             r"^final_layer\.adaLN_modulation\.1\.(.*)$": r"norm_out.linear.\1",
             r"^final_layer\.linear\.(.*)$": r"proj_out.\1",
-            # BFL format: RMSNorm uses "scale" parameter; rename to "weight" (model uses .weight)
+            # FLUX2-nvfp4 format: RMSNorm uses "scale" parameter; rename to "weight" (model uses .weight)
             r"^(.*)\.scale$": r"\1.weight",
             # transformer_blocks nunchaku format (raw export - before internal conversion)
             r"^transformer_blocks\.(\d+)\.mlp_fc1\.(.*)$": r"transformer_blocks.\1.ff.net.0.proj.\2",
             r"^transformer_blocks\.(\d+)\.mlp_fc2\.(.*)$": r"transformer_blocks.\1.ff.net.2.\2",
             r"^transformer_blocks\.(\d+)\.mlp_context_fc1\.(.*)$": r"transformer_blocks.\1.ff_context.net.0.proj.\2",
             r"^transformer_blocks\.(\d+)\.mlp_context_fc2\.(.*)$": r"transformer_blocks.\1.ff_context.net.2.\2",
-            # nunchaku packed QKV → split into separate Q, K, V
-            r"^transformer_blocks\.(\d+)\.qkv_proj\.(.*)$": [
-                r"transformer_blocks.\1.attn.to_q.\2",
-                r"transformer_blocks.\1.attn.to_k.\2",
-                r"transformer_blocks.\1.attn.to_v.\2",
-            ],
-            r"^transformer_blocks\.(\d+)\.qkv_proj_context\.(.*)$": [
-                r"transformer_blocks.\1.attn.add_q_proj.\2",
-                r"transformer_blocks.\1.attn.add_k_proj.\2",
-                r"transformer_blocks.\1.attn.add_v_proj.\2",
-            ],
+            # nunchaku packed QKV → fused to_qkv / to_added_qkv (matches use_fused_qkv in model)
+            r"^transformer_blocks\.(\d+)\.qkv_proj\.(.*)$": r"transformer_blocks.\1.attn.to_qkv.\2",
+            r"^transformer_blocks\.(\d+)\.qkv_proj_context\.(.*)$": r"transformer_blocks.\1.attn.to_added_qkv.\2",
             r"^transformer_blocks\.(\d+)\.out_proj\.(.*)$": r"transformer_blocks.\1.attn.to_out.0.\2",
             r"^transformer_blocks\.(\d+)\.out_proj_context\.(.*)$": r"transformer_blocks.\1.attn.to_add_out.\2",
             r"^transformer_blocks\.(\d+)\.norm_q\.(.*)$": r"transformer_blocks.\1.attn.norm_q.\2",
             r"^transformer_blocks\.(\d+)\.norm_k\.(.*)$": r"transformer_blocks.\1.attn.norm_k.\2",
             r"^transformer_blocks\.(\d+)\.norm_added_q\.(.*)$": r"transformer_blocks.\1.attn.norm_added_q.\2",
             r"^transformer_blocks\.(\d+)\.norm_added_k\.(.*)$": r"transformer_blocks.\1.attn.norm_added_k.\2",
-            # nunchaku format (already converted): packed add_qkv → split
-            r"^transformer_blocks\.(\d+)\.attn\.add_qkv_proj\.(.*)$": [
-                r"transformer_blocks.\1.attn.add_q_proj.\2",
-                r"transformer_blocks.\1.attn.add_k_proj.\2",
-                r"transformer_blocks.\1.attn.add_v_proj.\2",
-            ],
+            # nunchaku format (already converted): add_qkv_proj → fused to_added_qkv
+            r"^transformer_blocks\.(\d+)\.attn\.add_qkv_proj\.(.*)$": r"transformer_blocks.\1.attn.to_added_qkv.\2",
             # single_transformer_blocks nunchaku format (raw export - before internal conversion)
             r"^single_transformer_blocks\.(\d+)\.qkv_proj\.(.*)$": r"single_transformer_blocks.\1.attn.to_qkv_mlp_proj.\2",
             r"^single_transformer_blocks\.(\d+)\.out_proj\.(.*)$": r"single_transformer_blocks.\1.attn.to_out.\2",

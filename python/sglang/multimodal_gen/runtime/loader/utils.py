@@ -31,8 +31,8 @@ def set_default_torch_dtype(dtype: torch.dtype):
 
 
 def get_param_names_mapping(
-    mapping_dict: dict[str, str | tuple[str, int, int] | list[str]],
-) -> Callable[[str], tuple[str | list[str], Any, Any]]:
+    mapping_dict: dict[str, str | tuple[str, int, int]],
+) -> Callable[[str], tuple[str, Any, Any]]:
     """
     Creates a mapping function that transforms parameter names using regex patterns.
 
@@ -41,15 +41,12 @@ def get_param_names_mapping(
             Values can be:
             - str: 1-to-1 rename
             - tuple(str, int, int): N-to-1 merge (target, merge_index, total)
-            - list[str]: 1-to-N split (each element is a separate target name pattern)
 
     Returns:
         A function that maps parameter names from source to target format.
-        Returns (target_name, merge_index, total_split_params) where target_name
-        may be a list[str] when a split mapping was applied.
     """
 
-    def mapping_fn(name: str) -> tuple[str | list[str], Any, Any]:
+    def mapping_fn(name: str) -> tuple[str, Any, Any]:
         # support chained conversions, e.g.:
         # transformer.xxx.lora_down -> xxx.lora_down -> xxx.proj_down
         merge_index = None
@@ -69,15 +66,6 @@ def get_param_names_mapping(
 
                 curr_merge_index = None
                 curr_total_split_params = None
-
-                # 1-to-N split: replacement is a list of target patterns
-                if isinstance(replacement, list):
-                    new_names = [re.sub(pattern, r, name) for r in replacement]
-                    # Only apply if all new names differ from the source
-                    if all(n != name for n in new_names):
-                        applied_patterns.add(pattern)
-                        return new_names, None, None
-                    continue
 
                 if isinstance(replacement, tuple):
                     curr_merge_index = replacement[1]
@@ -133,22 +121,6 @@ def hf_to_custom_state_dict(
             source_param_name
         )
         if target_param_name == "" or target_param_name is None:  # type: ignore[comparison-overlap]
-            continue
-
-        # 1-to-N split: target_param_name is a list of target names
-        if isinstance(target_param_name, list):
-            n = len(target_param_name)
-            if full_tensor.numel() > 1 and full_tensor.shape[0] % n == 0:
-                # Split structured tensor along dim 0 (output dimension)
-                slice_size = full_tensor.shape[0] // n
-                for i, tname in enumerate(target_param_name):
-                    custom_param_sd[tname] = full_tensor.narrow(0, i * slice_size, slice_size).clone()
-                    reverse_param_names_mapping[tname] = (source_param_name, None, None)
-            else:
-                # Scalar or indivisible tensor: broadcast to all targets
-                for tname in target_param_name:
-                    custom_param_sd[tname] = full_tensor.clone()
-                    reverse_param_names_mapping[tname] = (source_param_name, None, None)
             continue
 
         reverse_param_names_mapping[target_param_name] = (

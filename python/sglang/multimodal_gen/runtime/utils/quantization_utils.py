@@ -243,12 +243,7 @@ def build_nvfp4_config_from_safetensors(
         for module_bfl in non_quantized_bfl_modules:
             # Append .weight so the mapping patterns (which match full param names) work
             mapped, _, _ = mapping_fn(f"{module_bfl}.weight")
-            if isinstance(mapped, list):
-                # 1-to-N split (e.g., packed qkv → separate q, k, v)
-                for m in mapped:
-                    exclude_modules.append(m[: -len(".weight")] if m.endswith(".weight") else m)
-            else:
-                exclude_modules.append(mapped[: -len(".weight")] if mapped.endswith(".weight") else mapped)
+            exclude_modules.append(mapped[: -len(".weight")] if mapped.endswith(".weight") else mapped)
     else:
         exclude_modules = non_quantized_bfl_modules
 

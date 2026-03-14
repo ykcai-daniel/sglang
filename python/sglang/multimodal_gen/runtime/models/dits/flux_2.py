@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -26,6 +27,9 @@ from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm, apply_qk_nor
 from sglang.multimodal_gen.runtime.layers.linear import ColumnParallelLinear
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
+)
+from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
+    ModelOptFp4Config,
 )
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     NDRotaryEmbedding,
@@ -42,15 +46,23 @@ logger = init_logger(__name__)  # pylint: disable=invalid-name
 def _get_qkv_projections(
     attn: "Flux2Attention", hidden_states, encoder_hidden_states=None
 ):
-    query, _ = attn.to_q(hidden_states)
-    key, _ = attn.to_k(hidden_states)
-    value, _ = attn.to_v(hidden_states)
+    if getattr(attn, "use_fused_qkv", False):
+        qkv, _ = attn.to_qkv(hidden_states)
+        query, key, value = [t.contiguous() for t in qkv.chunk(3, dim=-1)]
+    else:
+        query, _ = attn.to_q(hidden_states)
+        key, _ = attn.to_k(hidden_states)
+        value, _ = attn.to_v(hidden_states)
 
     encoder_query = encoder_key = encoder_value = None
     if encoder_hidden_states is not None and attn.added_kv_proj_dim is not None:
-        encoder_query, _ = attn.add_q_proj(encoder_hidden_states)
-        encoder_key, _ = attn.add_k_proj(encoder_hidden_states)
-        encoder_value, _ = attn.add_v_proj(encoder_hidden_states)
+        if getattr(attn, "use_fused_added_qkv", False):
+            added_qkv, _ = attn.to_added_qkv(encoder_hidden_states)
+            encoder_query, encoder_key, encoder_value = [t.contiguous() for t in added_qkv.chunk(3, dim=-1)]
+        else:
+            encoder_query, _ = attn.add_q_proj(encoder_hidden_states)
+            encoder_key, _ = attn.add_k_proj(encoder_hidden_states)
+            encoder_value, _ = attn.add_v_proj(encoder_hidden_states)
 
     return query, key, value, encoder_query, encoder_key, encoder_value
 
@@ -136,30 +148,45 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
         self.added_kv_proj_dim = added_kv_proj_dim
         self.added_proj_bias = added_proj_bias
 
-        self.to_q = ColumnParallelLinear(
-            query_dim,
-            self.inner_dim,
-            bias=bias,
-            gather_output=True,
-            quant_config=quant_config,
-            prefix=f"{prefix}.to_q" if prefix else "to_q",
-        )
-        self.to_k = ColumnParallelLinear(
-            query_dim,
-            self.inner_dim,
-            bias=bias,
-            gather_output=True,
-            quant_config=quant_config,
-            prefix=f"{prefix}.to_k" if prefix else "to_k",
-        )
-        self.to_v = ColumnParallelLinear(
-            query_dim,
-            self.inner_dim,
-            bias=bias,
-            gather_output=True,
-            quant_config=quant_config,
-            prefix=f"{prefix}.to_v" if prefix else "to_v",
-        )
+        # Fuse Q/K/V into a single linear when using NVFP4: the checkpoint stores them
+        # packed as one tensor, so a fused layer avoids splitting during weight loading.
+        self.use_fused_qkv = isinstance(quant_config, ModelOptFp4Config)
+        self.use_fused_added_qkv = self.use_fused_qkv
+
+        if self.use_fused_qkv:
+            self.to_qkv = ColumnParallelLinear(
+                query_dim,
+                self.inner_dim * 3,
+                bias=bias,
+                gather_output=True,
+                quant_config=quant_config,
+                prefix=f"{prefix}.to_qkv" if prefix else "to_qkv",
+            )
+        else:
+            self.to_q = ColumnParallelLinear(
+                query_dim,
+                self.inner_dim,
+                bias=bias,
+                gather_output=True,
+                quant_config=quant_config,
+                prefix=f"{prefix}.to_q" if prefix else "to_q",
+            )
+            self.to_k = ColumnParallelLinear(
+                query_dim,
+                self.inner_dim,
+                bias=bias,
+                gather_output=True,
+                quant_config=quant_config,
+                prefix=f"{prefix}.to_k" if prefix else "to_k",
+            )
+            self.to_v = ColumnParallelLinear(
+                query_dim,
+                self.inner_dim,
+                bias=bias,
+                gather_output=True,
+                quant_config=quant_config,
+                prefix=f"{prefix}.to_v" if prefix else "to_v",
+            )
 
         # QK Norm
         self.norm_q = RMSNorm(dim_head, eps=eps)
@@ -181,30 +208,41 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
         if added_kv_proj_dim is not None:
             self.norm_added_q = RMSNorm(dim_head, eps=eps)
             self.norm_added_k = RMSNorm(dim_head, eps=eps)
-            self.add_q_proj = ColumnParallelLinear(
-                added_kv_proj_dim,
-                self.inner_dim,
-                bias=added_proj_bias,
-                gather_output=True,
-                quant_config=quant_config,
-                prefix=f"{prefix}.add_q_proj" if prefix else "add_q_proj",
-            )
-            self.add_k_proj = ColumnParallelLinear(
-                added_kv_proj_dim,
-                self.inner_dim,
-                bias=added_proj_bias,
-                gather_output=True,
-                quant_config=quant_config,
-                prefix=f"{prefix}.add_k_proj" if prefix else "add_k_proj",
-            )
-            self.add_v_proj = ColumnParallelLinear(
-                added_kv_proj_dim,
-                self.inner_dim,
-                bias=added_proj_bias,
-                gather_output=True,
-                quant_config=quant_config,
-                prefix=f"{prefix}.add_v_proj" if prefix else "add_v_proj",
-            )
+            if self.use_fused_added_qkv:
+                # txt_attn.qkv is always BF16 in the NVFP4 checkpoint — no quant needed
+                self.to_added_qkv = ColumnParallelLinear(
+                    added_kv_proj_dim,
+                    self.inner_dim * 3,
+                    bias=added_proj_bias,
+                    gather_output=True,
+                    quant_config=None,
+                    prefix=f"{prefix}.to_added_qkv" if prefix else "to_added_qkv",
+                )
+            else:
+                self.add_q_proj = ColumnParallelLinear(
+                    added_kv_proj_dim,
+                    self.inner_dim,
+                    bias=added_proj_bias,
+                    gather_output=True,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.add_q_proj" if prefix else "add_q_proj",
+                )
+                self.add_k_proj = ColumnParallelLinear(
+                    added_kv_proj_dim,
+                    self.inner_dim,
+                    bias=added_proj_bias,
+                    gather_output=True,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.add_k_proj" if prefix else "add_k_proj",
+                )
+                self.add_v_proj = ColumnParallelLinear(
+                    added_kv_proj_dim,
+                    self.inner_dim,
+                    bias=added_proj_bias,
+                    gather_output=True,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.add_v_proj" if prefix else "add_v_proj",
+                )
             self.to_add_out = ColumnParallelLinear(
                 self.inner_dim,
                 query_dim,
