@@ -99,7 +99,9 @@ class TransformerLoader(ComponentLoader):
             if quant_config is None:
                 dit_config = getattr(server_args.pipeline_config, "dit_config", None)
                 arch_config = getattr(dit_config, "arch_config", None)
-                param_names_mapping_dict = getattr(arch_config, "param_names_mapping", None)
+                param_names_mapping_dict = getattr(
+                    arch_config, "param_names_mapping", None
+                )
                 for safetensors_file in safetensors_list:
                     quant_config = build_nvfp4_config_from_safetensors(
                         safetensors_file, param_names_mapping_dict

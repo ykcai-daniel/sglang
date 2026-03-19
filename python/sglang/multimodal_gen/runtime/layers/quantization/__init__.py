@@ -5,14 +5,13 @@ from typing import Literal, get_args
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8Config
 from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
 )
-
-from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8Config
 from sglang.multimodal_gen.runtime.layers.quantization.modelslim import ModelSlimConfig
 
-QuantizationMethods = Literal["fp8",  "modelopt_fp4","modelslim"]
+QuantizationMethods = Literal["fp8", "modelopt_fp4", "modelslim"]
 
 QUANTIZATION_METHODS: list[str] = list(get_args(QuantizationMethods))
 

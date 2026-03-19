@@ -29,14 +29,15 @@ import torch.nn.functional as F
 from torch.nn.parameter import Parameter  # noqa: F401 (used by _make_nvfp4_layer)
 
 try:
-    from flashinfer import mm_fp4, nvfp4_quantize
-    from flashinfer import SfLayout
+    from flashinfer import SfLayout, mm_fp4, nvfp4_quantize
+
     HAS_FLASHINFER_FP4 = True
 except ImportError:
     HAS_FLASHINFER_FP4 = False
 
 try:
     import comfy_kitchen  # noqa: F401
+
     HAS_CK = True
 except Exception:
     HAS_CK = False
@@ -78,7 +79,9 @@ def _make_nvfp4_layer(
     )
     layer.register_parameter(
         "alpha",
-        Parameter((1.0 / (x_global_sf * w_global_sf)).to(torch.float32), requires_grad=False),
+        Parameter(
+            (1.0 / (x_global_sf * w_global_sf)).to(torch.float32), requires_grad=False
+        ),
     )
     layer.register_parameter(
         "input_scale_inv",
@@ -99,8 +102,8 @@ def _make_nvfp4_ck_layer(
     Mirrors process_weights_after_loading: stores weight_qt (QuantizedTensor
     via TensorCoreNVFP4Layout) and input_scale_ck (per-tensor activation scale).
     """
-    from comfy_kitchen.tensor.nvfp4 import TensorCoreNVFP4Layout
     from comfy_kitchen.tensor.base import QuantizedTensor
+    from comfy_kitchen.tensor.nvfp4 import TensorCoreNVFP4Layout
 
     N = w.shape[0]
     w_global_sf = (448 * 6) / w.float().abs().nan_to_num().max()
@@ -110,17 +113,23 @@ def _make_nvfp4_ck_layer(
 
     # Use TensorCoreNVFP4Layout.quantize — same as process_weights_after_loading
     # would do if it were re-quantizing from BF16 (here the "checkpoint" is BF16 w)
-    w_qdata, w_params = TensorCoreNVFP4Layout.quantize(w.contiguous(), scale=weight_scale_2)
+    w_qdata, w_params = TensorCoreNVFP4Layout.quantize(
+        w.contiguous(), scale=weight_scale_2
+    )
     weight_qt = QuantizedTensor(w_qdata, "TensorCoreNVFP4Layout", w_params)
 
     layer = nn.Module()
     layer.weight_qt = weight_qt
-    layer.register_parameter("input_scale_ck", Parameter(input_scale_ck, requires_grad=False))
+    layer.register_parameter(
+        "input_scale_ck", Parameter(input_scale_ck, requires_grad=False)
+    )
     layer.output_size_per_partition = N
     return layer
 
 
-def _print_error_stats(label: str, out: torch.Tensor, ref: torch.Tensor) -> tuple[float, float]:
+def _print_error_stats(
+    label: str, out: torch.Tensor, ref: torch.Tensor
+) -> tuple[float, float]:
     """Print abs/rel error percentiles, cosine similarity, and magnitude ratio.
 
     Returns:
@@ -148,9 +157,11 @@ def _print_error_stats(label: str, out: torch.Tensor, ref: torch.Tensor) -> tupl
     pcts = [50, 90, 95, 99]
     abs_pct = [abs_err.quantile(p / 100).item() for p in pcts]
     rel_pct = [rel_err.quantile(p / 100).item() for p in pcts]
-    print(f"\n  [{label}]  cos_sim={cos_sim:.6f}  mag_ratio={mag_ratio:.4f}"
-          f"  (out={out_mean_abs:.4f} ref={ref_mean_abs:.4f})"
-          f"{'  NaN!' if has_nan else ''}{'  Inf!' if has_inf else ''}")
+    print(
+        f"\n  [{label}]  cos_sim={cos_sim:.6f}  mag_ratio={mag_ratio:.4f}"
+        f"  (out={out_mean_abs:.4f} ref={ref_mean_abs:.4f})"
+        f"{'  NaN!' if has_nan else ''}{'  Inf!' if has_inf else ''}"
+    )
     print(f"    atol p{pcts}: {[f'{v:.4f}' for v in abs_pct]}")
     print(f"    rtol p{pcts}: {[f'{v:.4f}' for v in rel_pct]}")
     return cos_sim, mag_ratio
@@ -225,7 +236,7 @@ class TestNvFp4Gemm(unittest.TestCase):
     #   K = input features (hidden dim)
     SHAPES = [
         # (M,    N,     K)
-        (1024, 6144, 6144),   # square: double-block img_attn.proj
+        (1024, 6144, 6144),  # square: double-block img_attn.proj
         (1024, 6144, 18432),  # double-block img_mlp.0  (3x expansion)
         (1024, 18432, 6144),  # double-block img_mlp.2  (3x expansion, transposed)
         (1024, 55296, 3072),  # single-block linear1 fused QKV+MLP
@@ -241,10 +252,12 @@ class TestNvFp4Gemm(unittest.TestCase):
         x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
         w = torch.randn(N, K, dtype=torch.bfloat16, device="cuda")
 
-        ref = torch.mm(x, w.T)                          # BF16 reference: [M, N]
-        out = _nvfp4_linear(x, w)                      # NVFP4 GEMM:     [M, N]
+        ref = torch.mm(x, w.T)  # BF16 reference: [M, N]
+        out = _nvfp4_linear(x, w)  # NVFP4 GEMM:     [M, N]
 
-        self.assertEqual(out.shape, ref.shape, f"shape mismatch: {out.shape} vs {ref.shape}")
+        self.assertEqual(
+            out.shape, ref.shape, f"shape mismatch: {out.shape} vs {ref.shape}"
+        )
 
         cos_sim, _ = _print_error_stats(f"M={M} N={N} K={K}", out, ref)
 
@@ -286,8 +299,8 @@ class TestCKFp4Layer(unittest.TestCase):
 
     def _run_one(self, M: int, N: int, K: int, seed: int = 0) -> None:
         from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
-            ModelOptFp4Config,
             ComfyUIFp4LinearMethod,
+            ModelOptFp4Config,
         )
 
         torch.manual_seed(seed)
@@ -300,15 +313,23 @@ class TestCKFp4Layer(unittest.TestCase):
         layer = _make_nvfp4_ck_layer(w, x_global_sf)
 
         cfg = ModelOptFp4Config(
-            is_checkpoint_nvfp4_serialized=True, group_size=GROUP_SIZE, exclude_modules=[]
+            is_checkpoint_nvfp4_serialized=True,
+            group_size=GROUP_SIZE,
+            exclude_modules=[],
         )
         out = ComfyUIFp4LinearMethod(cfg).apply(layer, x)
 
-        self.assertEqual(out.shape, ref.shape, f"shape mismatch: {out.shape} vs {ref.shape}")
+        self.assertEqual(
+            out.shape, ref.shape, f"shape mismatch: {out.shape} vs {ref.shape}"
+        )
 
         label = f"CK M={M} N={N} K={K}"
-        self.assertFalse(out.float().isnan().any().item(), f"{label}: output contains NaN")
-        self.assertFalse(out.float().isinf().any().item(), f"{label}: output contains Inf")
+        self.assertFalse(
+            out.float().isnan().any().item(), f"{label}: output contains NaN"
+        )
+        self.assertFalse(
+            out.float().isinf().any().item(), f"{label}: output contains Inf"
+        )
 
         cos_sim, mag_ratio = _print_error_stats(label, out, ref)
         self.assertGreater(
@@ -316,8 +337,14 @@ class TestCKFp4Layer(unittest.TestCase):
             self.COS_SIM_THRESHOLD,
             f"{label}: cos_sim={cos_sim:.4f} < {self.COS_SIM_THRESHOLD}",
         )
-        self.assertGreater(mag_ratio, 0.5, f"{label}: magnitude too small (ratio={mag_ratio:.4f})")
-        self.assertLess(mag_ratio, 2.0, f"{label}: magnitude too large / overflow (ratio={mag_ratio:.4f})")
+        self.assertGreater(
+            mag_ratio, 0.5, f"{label}: magnitude too small (ratio={mag_ratio:.4f})"
+        )
+        self.assertLess(
+            mag_ratio,
+            2.0,
+            f"{label}: magnitude too large / overflow (ratio={mag_ratio:.4f})",
+        )
 
     def test_shapes(self):
         for M, N, K in self.SHAPES:
@@ -327,8 +354,8 @@ class TestCKFp4Layer(unittest.TestCase):
     def test_batch_dims(self):
         """ComfyUIFp4LinearMethod.apply() must handle 3-D inputs [B, S, K] correctly."""
         from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
-            ModelOptFp4Config,
             ComfyUIFp4LinearMethod,
+            ModelOptFp4Config,
         )
 
         N, K = 6144, 6144
@@ -341,7 +368,9 @@ class TestCKFp4Layer(unittest.TestCase):
         x_global_sf = (448 * 6) / x3.float().abs().nan_to_num().max()
         layer = _make_nvfp4_ck_layer(w, x_global_sf)
         cfg = ModelOptFp4Config(
-            is_checkpoint_nvfp4_serialized=True, group_size=GROUP_SIZE, exclude_modules=[]
+            is_checkpoint_nvfp4_serialized=True,
+            group_size=GROUP_SIZE,
+            exclude_modules=[],
         )
         method = ComfyUIFp4LinearMethod(cfg)
 
@@ -351,7 +380,8 @@ class TestCKFp4Layer(unittest.TestCase):
         self.assertEqual(out3.shape, (B, S, N))
         self.assertEqual(out2.shape, (B * S, N))
         torch.testing.assert_close(
-            out3.view(-1, N).float(), out2.float(),
+            out3.view(-1, N).float(),
+            out2.float(),
             msg="3-D and 2-D inputs must give the same flat output",
         )
 
@@ -381,7 +411,7 @@ class TestFp4LayerVsFlashinfer(unittest.TestCase):
         (1024, 6144, 12288),
     ]
 
-    COS_SIM_THRESHOLD = 0.97   # FP4 vs BF16
+    COS_SIM_THRESHOLD = 0.97  # FP4 vs BF16
     CROSS_SIM_THRESHOLD = 0.99  # two FP4 impls should be very close
 
     def _run_one(self, M: int, N: int, K: int, seed: int = 0) -> None:
@@ -404,25 +434,34 @@ class TestFp4LayerVsFlashinfer(unittest.TestCase):
         x_global_sf = (448 * 6) / x.float().abs().nan_to_num().max()
         layer = _make_nvfp4_layer(w, x_global_sf)
         cfg = ModelOptFp4Config(
-            is_checkpoint_nvfp4_serialized=True, group_size=GROUP_SIZE, exclude_modules=[]
+            is_checkpoint_nvfp4_serialized=True,
+            group_size=GROUP_SIZE,
+            exclude_modules=[],
         )
         layer_out = ModelOptFp4LinearMethod(cfg).apply(layer, x)
 
         label = f"M={M} N={N} K={K}"
         cos_fi, _ = _print_error_stats(f"flashinfer vs bf16  [{label}]", fi_out, ref)
-        cos_layer, _ = _print_error_stats(f"modelopt  vs bf16  [{label}]", layer_out, ref)
-        cos_cross, _ = _print_error_stats(f"modelopt  vs fi    [{label}]", layer_out, fi_out)
+        cos_layer, _ = _print_error_stats(
+            f"modelopt  vs bf16  [{label}]", layer_out, ref
+        )
+        cos_cross, _ = _print_error_stats(
+            f"modelopt  vs fi    [{label}]", layer_out, fi_out
+        )
 
         self.assertGreater(
-            cos_fi, self.COS_SIM_THRESHOLD,
+            cos_fi,
+            self.COS_SIM_THRESHOLD,
             f"{label}: flashinfer vs bf16 cos_sim={cos_fi:.4f} < {self.COS_SIM_THRESHOLD}",
         )
         self.assertGreater(
-            cos_layer, self.COS_SIM_THRESHOLD,
+            cos_layer,
+            self.COS_SIM_THRESHOLD,
             f"{label}: modelopt vs bf16 cos_sim={cos_layer:.4f} < {self.COS_SIM_THRESHOLD}",
         )
         self.assertGreater(
-            cos_cross, self.CROSS_SIM_THRESHOLD,
+            cos_cross,
+            self.CROSS_SIM_THRESHOLD,
             f"{label}: modelopt vs flashinfer cos_sim={cos_cross:.4f} < {self.CROSS_SIM_THRESHOLD}",
         )
 

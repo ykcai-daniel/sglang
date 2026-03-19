@@ -209,6 +209,7 @@ def build_nvfp4_config_from_safetensors(
     group_size = None
     non_quantized_bfl_modules = []
     import torch
+
     with safe_open(file_path, framework="pt", device="cpu") as f:
         all_keys = set(f.keys())
         # Infer group_size from first quantized layer's weight and weight_scale shapes
@@ -231,7 +232,9 @@ def build_nvfp4_config_from_safetensors(
                     non_quantized_bfl_modules.append(k[: -len(".weight")])
 
     if group_size is None:
-        logger.warning("Could not infer group_size from NVFP4 safetensors: %s", file_path)
+        logger.warning(
+            "Could not infer group_size from NVFP4 safetensors: %s", file_path
+        )
         return None
 
     # Convert BFL module names to HF names using param_names_mapping
@@ -243,7 +246,9 @@ def build_nvfp4_config_from_safetensors(
         for module_bfl in non_quantized_bfl_modules:
             # Append .weight so the mapping patterns (which match full param names) work
             mapped, _, _ = mapping_fn(f"{module_bfl}.weight")
-            exclude_modules.append(mapped[: -len(".weight")] if mapped.endswith(".weight") else mapped)
+            exclude_modules.append(
+                mapped[: -len(".weight")] if mapped.endswith(".weight") else mapped
+            )
     else:
         exclude_modules = non_quantized_bfl_modules
 

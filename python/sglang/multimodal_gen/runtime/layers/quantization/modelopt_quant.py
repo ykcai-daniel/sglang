@@ -20,8 +20,6 @@ from sglang.multimodal_gen.runtime.models.parameter import (
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.srt.layers.quantization.modelopt_quant import (
-    ACTIVATION_SCHEMES,
-    FP4_GEMM_ALIGNMENT,
     pad_nvfp4_activation_for_cutlass,
     pad_nvfp4_weight,
     round_up,
