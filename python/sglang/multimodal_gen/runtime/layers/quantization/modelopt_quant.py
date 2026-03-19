@@ -47,11 +47,11 @@ except Exception:
     pass
 
 cutlass_fp4_gemm = None
-try:
-    from flashinfer import mm_fp4 as _flashinfer_fp4_gemm  # noqa: F401
-except ImportError:
-    if current_platform.is_cuda():
+if current_platform.is_cuda():
+    try:
         from sgl_kernel import cutlass_scaled_fp4_mm as cutlass_fp4_gemm
+    except ImportError:
+        pass
 
 logger = logging.getLogger(__name__)
 
