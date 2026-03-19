@@ -330,12 +330,10 @@ def load_model_from_full_model_state_dict(
                 )
             else:
                 logger.warning(
-                    "Dtype mismatch for %s: checkpoint has %s, model expects %s — casting",
-                logger.warning(
                     "Dtype mismatch for %s: checkpoint has %s, model expects %s. This is a fatal error.",
                     target_param_name, full_tensor.dtype, target_dtype,
                 )
-            raise Exception(f"dtype mismatch for {target_param_name}")
+                raise Exception(f"dtype mismatch for {target_param_name}")
 
         if not hasattr(meta_sharded_param, "device_mesh"):
             full_tensor = full_tensor.to(device=device, dtype=target_dtype)
