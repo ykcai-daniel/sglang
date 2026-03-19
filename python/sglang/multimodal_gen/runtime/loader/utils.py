@@ -37,13 +37,10 @@ def get_param_names_mapping(
     Creates a mapping function that transforms parameter names using regex patterns.
 
     Args:
-        mapping_dict: Dictionary mapping regex patterns to replacement patterns.
-            Values can be:
-            - str: 1-to-1 rename
-            - tuple(str, int, int): N-to-1 merge (target, merge_index, total)
+        mapping_dict (Dict[str, str]): Dictionary mapping regex patterns to replacement patterns
 
     Returns:
-        A function that maps parameter names from source to target format.
+        Callable[[str], str]: A function that maps parameter names from source to target format
     """
 
     def mapping_fn(name: str) -> tuple[str, Any, Any]:
@@ -66,7 +63,6 @@ def get_param_names_mapping(
 
                 curr_merge_index = None
                 curr_total_split_params = None
-
                 if isinstance(replacement, tuple):
                     curr_merge_index = replacement[1]
                     curr_total_split_params = replacement[2]
@@ -122,7 +118,6 @@ def hf_to_custom_state_dict(
         )
         if target_param_name == "" or target_param_name is None:  # type: ignore[comparison-overlap]
             continue
-
         reverse_param_names_mapping[target_param_name] = (
             source_param_name,
             merge_index,
