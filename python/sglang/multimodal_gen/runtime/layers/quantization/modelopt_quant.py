@@ -19,9 +19,16 @@ from sglang.multimodal_gen.runtime.models.parameter import (
     PerTensorScaleParameter,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.srt.layers.quantization.modelopt_quant import (
+    ACTIVATION_SCHEMES,
+    FP4_GEMM_ALIGNMENT,
+    pad_nvfp4_activation_for_cutlass,
+    pad_nvfp4_weight,
+    round_up_to_multiple,
+    slice_nvfp4_output,
+)
 from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.layers.utils.common import copy_or_rebind_param
-from sglang.srt.utils.custom_op import register_custom_op
 
 # FP4 activation quantization kernel (flashinfer on Blackwell, sgl_kernel elsewhere).
 fp4_quantize = None
@@ -43,163 +50,16 @@ try:
 except Exception:
     pass
 
-# FP4 GEMM: prefer flashinfer, fall back to sgl_kernel CUTLASS.
-flashinfer_fp4_gemm = None
-enable_flashinfer_fp4_gemm = False
+# CUTLASS FP4 GEMM fallback (when flashinfer is not available).
 cutlass_fp4_gemm = None
 try:
-    from flashinfer import mm_fp4 as flashinfer_fp4_gemm
-
-    enable_flashinfer_fp4_gemm = True
+    from flashinfer import mm_fp4 as _flashinfer_fp4_gemm  # noqa: F401
 except ImportError:
     if current_platform.is_cuda():
         from sgl_kernel import cutlass_scaled_fp4_mm as cutlass_fp4_gemm
 
-
 # Initialize logger for the module
 logger = logging.getLogger(__name__)
-
-
-def _sglang_fp4_gemm_fake(
-    input: torch.Tensor,
-    weight: torch.Tensor,
-    input_sf: torch.Tensor,
-    weight_sf: torch.Tensor,
-    alpha: torch.Tensor,
-    out_dtype: torch.dtype,
-    out_features: int,
-) -> torch.Tensor:
-    M = input.shape[-2]
-    N = int(out_features)
-    return input.new_empty((M, N), dtype=out_dtype)
-
-
-@register_custom_op(fake_impl=_sglang_fp4_gemm_fake)
-def fp4_gemm(
-    input: torch.Tensor,
-    weight: torch.Tensor,
-    input_sf: torch.Tensor,
-    weight_sf: torch.Tensor,
-    alpha: torch.Tensor,
-    out_dtype: torch.dtype,
-    out_features: int,
-) -> torch.Tensor:
-    backend = FLASHINFER_FP4_GEMM_BACKEND if FLASHINFER_FP4_GEMM_BACKEND else "cudnn"
-    if enable_flashinfer_fp4_gemm:
-        return flashinfer_fp4_gemm(
-            input,
-            weight,
-            input_sf,
-            weight_sf,
-            alpha,
-            out_dtype,
-            backend=backend,
-            skip_check=False,
-        )
-    else:
-        if cutlass_fp4_gemm is None:
-            raise RuntimeError(
-                "Neither flashinfer nor sgl_kernel.cutlass_scaled_fp4_mm is available. "
-                "Install flashinfer or upgrade sgl_kernel to use fp4_gemm."
-            )
-        return cutlass_fp4_gemm(input, weight, input_sf, weight_sf, alpha, out_dtype)
-
-
-# Comment out as it can't re-register the same sgl_kernel::scaled_fp4_quant
-# if (
-#     current_platform.is_cuda()
-#     and (not current_platform.is_sm120())
-#     and (fp4_quantize is not None)
-# ):
-
-#     @register_fake_if_exists("sgl_kernel::scaled_fp4_quant")
-#     def _sgl_kernel_scaled_fp4_quant_fake(
-#         output, input, output_scale, input_global_scale
-#     ):
-#         return
-
-
-FLASHINFER_FP4_GEMM_BACKEND = None
-
-FP4_GEMM_ALIGNMENT = 32
-
-
-def round_up_to_multiple(x: int, m: int) -> int:
-    """Round up x to the nearest multiple of m."""
-    return (x + m - 1) // m * m
-
-
-def pad_nvfp4_weight(
-    weight: torch.Tensor,
-    n_alignment: int = FP4_GEMM_ALIGNMENT,
-    k_alignment: int = FP4_GEMM_ALIGNMENT,
-) -> tuple:
-    """
-    Pad packed NVFP4 weights to satisfy alignment constraints for FP4 GEMM kernels.
-
-    Different backends have different alignment requirements:
-    - CUTLASS/cuDNN: N % 32 == 0, K % 32 == 0
-    - TRTLLM: N % 128 == 0 (for shuffle_matrix_sf_a), K padding handled separately
-
-    Args:
-        weight: Packed FP4 weight tensor of shape [N, K//2] (2 FP4 values per byte)
-        n_alignment: Required alignment for N dimension (default 32, use 128 for TRTLLM)
-        k_alignment: Required alignment for K dimension (default 32, use 0 to skip)
-
-    Returns:
-        Tuple of (padded_weight, weights_padding_cols) where weights_padding_cols
-        is the number of columns added for K-dimension padding (in bytes).
-    """
-    weight_current_rows = weight.shape[0]  # N dimension
-    weight_current_col_bytes = weight.shape[1]  # K//2 (packed)
-
-    # Calculate padding for N dimension (rows)
-    pad_rows = 0
-    if n_alignment > 0 and weight_current_rows % n_alignment != 0:
-        total_rows = round_up_to_multiple(weight_current_rows, n_alignment)
-        pad_rows = total_rows - weight_current_rows
-
-    # Calculate padding for K dimension (columns)
-    # 2 FP4 items are packed per byte in the input dimension
-    weight_current_col_elements = weight_current_col_bytes * 2
-    pad_cols_bytes = 0
-    if k_alignment > 0 and weight_current_col_elements % k_alignment != 0:
-        total_cols = round_up_to_multiple(weight_current_col_elements, k_alignment)
-        pad_cols = total_cols - weight_current_col_elements
-        # pad_cols is in elements, but padding is in bytes (2 elements per byte)
-        pad_cols_bytes = pad_cols // 2
-
-    # Apply padding in a single operation if needed
-    if pad_rows > 0 or pad_cols_bytes > 0:
-        weight = torch.nn.functional.pad(
-            weight, (0, pad_cols_bytes, 0, pad_rows)
-        ).contiguous()
-
-    return weight, pad_cols_bytes
-
-
-def pad_nvfp4_activation_for_cutlass(
-    x_fp4: torch.Tensor,
-    weights_padding_cols: int,
-) -> torch.Tensor:
-    """Pad packed FP4 activations to match the K-dimension padding applied to weights."""
-    if weights_padding_cols > 0:
-        return torch.nn.functional.pad(x_fp4, (0, weights_padding_cols)).contiguous()
-    return x_fp4
-
-
-def slice_nvfp4_output(
-    out: torch.Tensor,
-    output_size: int,
-) -> torch.Tensor:
-    """Slice the output tensor to remove N-dimension padding added to weights."""
-    if out.shape[-1] != output_size:
-        return out[..., :output_size].contiguous()
-    return out
-
-
-# Supported activation schemes for the current configuration
-ACTIVATION_SCHEMES = ["static"]
 
 
 class ModelOptQuantConfig(QuantizationConfig):
@@ -557,7 +417,6 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
 
         # Get original output size (before padding) and padded weight size
         output_size = layer.output_size_per_partition
-        w_n = layer.weight.shape[0]
         output_shape = list(input_shape[:-1]) + [output_size]
 
         # Quantize BF16 or FP16 to (FP4 and interleaved block scale)

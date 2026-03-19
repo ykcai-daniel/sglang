@@ -587,9 +587,6 @@ def maybe_download_model(
             )
         repo_id = f"{parts[0]}/{parts[1]}"
         filename = parts[2]
-        # Accept GitHub/HF web-style references such as hf://namespace/repo/blob/filename.safetensors.
-        if filename.startswith("blob/"):
-            filename = filename[len("blob/") :]
         # Cache-first: try local_files_only before hitting the network.
         try:
             local_path = hf_hub_download(
