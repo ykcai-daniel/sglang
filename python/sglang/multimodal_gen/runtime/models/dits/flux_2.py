@@ -45,7 +45,7 @@ logger = init_logger(__name__)  # pylint: disable=invalid-name
 def _get_qkv_projections(
     attn: "Flux2Attention", hidden_states, encoder_hidden_states=None
 ):
-    if getattr(attn, "use_fused_qkv", False):
+    if attn.use_fused_qkv:
         qkv, _ = attn.to_qkv(hidden_states)
         query, key, value = [t.contiguous() for t in qkv.chunk(3, dim=-1)]
     else:
