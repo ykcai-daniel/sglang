@@ -253,8 +253,7 @@ class ModelOptQuantConfig(QuantizationConfig):
                     f"Unsupported quant_algo '{quant_algo}' for user_quant 'modelopt'. Using the default 'modelopt_fp4' quant_algo."
                 )
 
-            # The hf_quant_config may be a parsed quant config, so we need to check the
-            # quant_method.if hf_quant_config.get("quant_method", "") == "modelopt_fp4":
+            # The hf_quant_config may be a parsed quant config, so we need to check the quant_method.
             return "modelopt_fp4"
 
         return None
