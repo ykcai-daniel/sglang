@@ -55,7 +55,7 @@ from sglang.srt.utils.common import (
     is_cuda,
     is_sm120_supported,
     next_power_of_2,
-    round_up_to_multiple,
+    round_up,
 )
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.patch_torch import register_fake_if_exists
@@ -189,7 +189,7 @@ def pad_nvfp4_weight(
     # Calculate padding for N dimension (rows)
     pad_rows = 0
     if n_alignment > 0 and weight_current_rows % n_alignment != 0:
-        total_rows = round_up_to_multiple(weight_current_rows, n_alignment)
+        total_rows = round_up(weight_current_rows, n_alignment)
         pad_rows = total_rows - weight_current_rows
 
     # Calculate padding for K dimension (columns)
@@ -197,7 +197,7 @@ def pad_nvfp4_weight(
     weight_current_col_elements = weight_current_col_bytes * 2
     pad_cols_bytes = 0
     if k_alignment > 0 and weight_current_col_elements % k_alignment != 0:
-        total_cols = round_up_to_multiple(weight_current_col_elements, k_alignment)
+        total_cols = round_up(weight_current_col_elements, k_alignment)
         pad_cols = total_cols - weight_current_col_elements
         # pad_cols is in elements, but padding is in bytes (2 elements per byte)
         pad_cols_bytes = pad_cols // 2
@@ -1392,7 +1392,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
             scale_k = scale.shape[1]  # K/16
             weights_padding_cols = 0
             if scale_k % 4 != 0:
-                padded_scale_k = round_up_to_multiple(scale_k, 4)
+                padded_scale_k = round_up(scale_k, 4)
                 pad_scale_k = padded_scale_k - scale_k
                 # Pad scale K/16 dimension
                 scale = torch.nn.functional.pad(scale, (0, pad_scale_k, 0, 0))
@@ -1429,8 +1429,8 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
             scales = scales.unsqueeze(0)
         assert scales.ndim == 3
         B, M, K = scales.shape
-        M_padded = round_up_to_multiple(M, 128)
-        K_padded = round_up_to_multiple(K, 4)
+        M_padded = round_up(M, 128)
+        K_padded = round_up(K, 4)
         padded_scales = torch.zeros((B, M_padded, K_padded), dtype=scales.dtype)
         padded_scales[:B, :M, :K] = scales
         batches, rows, cols = padded_scales.shape

@@ -24,7 +24,7 @@ from sglang.srt.layers.quantization.modelopt_quant import (
     FP4_GEMM_ALIGNMENT,
     pad_nvfp4_activation_for_cutlass,
     pad_nvfp4_weight,
-    round_up_to_multiple,
+    round_up,
     slice_nvfp4_output,
 )
 from sglang.srt.layers.quantization.utils import is_layer_skipped
@@ -387,8 +387,8 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
             scales = scales.unsqueeze(0)
         assert scales.ndim == 3
         B, M, K = scales.shape
-        M_padded = round_up_to_multiple(M, 128)
-        K_padded = round_up_to_multiple(K, 4)
+        M_padded = round_up(M, 128)
+        K_padded = round_up(K, 4)
         padded_scales = torch.zeros((B, M_padded, K_padded), dtype=scales.dtype)
         padded_scales[:B, :M, :K] = scales
         batches, rows, cols = padded_scales.shape
@@ -575,8 +575,8 @@ class ComfyUIFp4LinearMethod(LinearMethodBase):
         # up in the correct tiled positions.
         scales = layer.weight_scale.data  # [N, K//16] fp8_e4m3fn
         N, Ks = scales.shape
-        N_padded = round_up_to_multiple(N, 128)
-        Ks_padded = round_up_to_multiple(Ks, 4)
+        N_padded = round_up(N, 128)
+        Ks_padded = round_up(Ks, 4)
 
         if N == N_padded and Ks == Ks_padded:
             # Already aligned — use the checkpoint block scales directly

@@ -11,7 +11,7 @@ import numpy
 import torch
 
 from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
-from sglang.srt.utils.common import round_up_to_multiple
+from sglang.srt.utils.common import round_up
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -577,8 +577,8 @@ def swizzle_blockscale(scale: torch.Tensor):
         scale = scale.unsqueeze(0)
     assert scale.ndim == 3
     B, M, K = scale.shape
-    M_padded = round_up_to_multiple(M, 128)
-    K_padded = round_up_to_multiple(K, 4)
+    M_padded = round_up(M, 128)
+    K_padded = round_up(K, 4)
     padded_scale = torch.zeros((B, M_padded, K_padded), dtype=scale.dtype)
     padded_scale[:B, :M, :K] = scale
     batches, rows, cols = padded_scale.shape
