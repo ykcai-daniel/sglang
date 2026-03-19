@@ -22,11 +22,11 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.srt.layers.quantization.modelopt_quant import (
     pad_nvfp4_activation_for_cutlass,
     pad_nvfp4_weight,
-    round_up,
     slice_nvfp4_output,
 )
 from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.layers.utils.common import copy_or_rebind_param
+from sglang.srt.utils.common import round_up
 
 fp4_quantize = None
 try:
