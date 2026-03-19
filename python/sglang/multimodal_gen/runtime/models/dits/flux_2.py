@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -58,7 +57,9 @@ def _get_qkv_projections(
     if encoder_hidden_states is not None and attn.added_kv_proj_dim is not None:
         if getattr(attn, "use_fused_added_qkv", False):
             added_qkv, _ = attn.to_added_qkv(encoder_hidden_states)
-            encoder_query, encoder_key, encoder_value = [t.contiguous() for t in added_qkv.chunk(3, dim=-1)]
+            encoder_query, encoder_key, encoder_value = [
+                t.contiguous() for t in added_qkv.chunk(3, dim=-1)
+            ]
         else:
             encoder_query, _ = attn.add_q_proj(encoder_hidden_states)
             encoder_key, _ = attn.add_k_proj(encoder_hidden_states)
@@ -101,12 +102,20 @@ class Flux2FeedForward(nn.Module):
 
         # Flux2SwiGLU will reduce the dimension by half
         self.linear_in = ColumnParallelLinear(
-            dim, inner_dim * 2, bias=bias, gather_output=True, quant_config=quant_config,
+            dim,
+            inner_dim * 2,
+            bias=bias,
+            gather_output=True,
+            quant_config=quant_config,
             prefix=f"{prefix}.linear_in" if prefix else "linear_in",
         )
         self.act_fn = Flux2SwiGLU()
         self.linear_out = ColumnParallelLinear(
-            inner_dim, dim_out, bias=bias, gather_output=True, quant_config=quant_config,
+            inner_dim,
+            dim_out,
+            bias=bias,
+            gather_output=True,
+            quant_config=quant_config,
             prefix=f"{prefix}.linear_out" if prefix else "linear_out",
         )
 
@@ -581,13 +590,21 @@ class Flux2TransformerBlock(nn.Module):
 
         self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
         self.ff = Flux2FeedForward(
-            dim=dim, dim_out=dim, mult=mlp_ratio, bias=bias, quant_config=quant_config,
+            dim=dim,
+            dim_out=dim,
+            mult=mlp_ratio,
+            bias=bias,
+            quant_config=quant_config,
             prefix=f"{prefix}.ff" if prefix else "ff",
         )
 
         self.norm2_context = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
         self.ff_context = Flux2FeedForward(
-            dim=dim, dim_out=dim, mult=mlp_ratio, bias=bias, quant_config=quant_config,
+            dim=dim,
+            dim_out=dim,
+            mult=mlp_ratio,
+            bias=bias,
+            quant_config=quant_config,
             prefix=f"{prefix}.ff_context" if prefix else "ff_context",
         )
 
@@ -765,6 +782,7 @@ class Flux2Transformer2DModel(CachableDiT, OffloadableDiTMixin):
     """
 
     param_names_mapping = FluxConfig().arch_config.param_names_mapping
+    scale_shift_swap_params = ("norm_out.linear.weight", "norm_out.linear.bias")
 
     def __init__(
         self,

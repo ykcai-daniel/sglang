@@ -297,12 +297,19 @@ def _get_config_info(
             return _CONFIG_REGISTRY.get(model_id)
 
     # 3. Use detectors
-    if os.path.exists(model_path):
-        config = verify_model_config_and_directory(model_path)
-    else:
-        config = maybe_download_model_index(model_path)
-
-    pipeline_name = config.get("_class_name", "").lower()
+    pipeline_name = ""
+    try:
+        if os.path.exists(model_path):
+            config = verify_model_config_and_directory(model_path)
+        else:
+            config = maybe_download_model_index(model_path)
+        pipeline_name = config.get("_class_name", "").lower()
+    except Exception:
+        logger.debug(
+            "Could not load model_index.json for '%s'; relying on path-based detectors",
+            model_path,
+            exc_info=True,
+        )
 
     matched_model_names = []
     for model_id, detector in _MODEL_NAME_DETECTORS:
@@ -683,6 +690,7 @@ def _register_configs():
         pipeline_config_cls=Flux2PipelineConfig,
         hf_model_paths=[
             "black-forest-labs/FLUX.2-dev",
+            "black-forest-labs/FLUX.2-dev-NVFP4",
         ],
         model_detectors=[
             lambda hf_id: "flux.2" in hf_id.lower() and "klein" not in hf_id.lower()
@@ -821,6 +829,7 @@ _register_configs()
 # Maps pattern -> pipeline_name for models that don't have model_index.json
 _NON_DIFFUSERS_MULTIMODAL_PATTERNS: Dict[str, str] = {
     "hunyuan3d": "Hunyuan3D2Pipeline",
+    "flux.2-dev-nvfp4": "Flux2NvfpPipeline",
 }
 
 

@@ -6,11 +6,9 @@ from typing import Any, Dict, List, Optional
 
 import torch
 
-import sglang.multimodal_gen.envs as envs
 from sglang.multimodal_gen.runtime.layers.linear import (
     LinearMethodBase,
     UnquantizedLinearMethod,
-    
 )
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
@@ -21,27 +19,34 @@ from sglang.multimodal_gen.runtime.models.parameter import (
     PerTensorScaleParameter,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
-from sglang.srt.layers.quantization.utils import is_layer_skipped, swizzle_blockscale
+from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.layers.utils.common import copy_or_rebind_param
 from sglang.srt.utils.custom_op import register_custom_op
 
+# FP4 activation quantization kernel (flashinfer on Blackwell, sgl_kernel elsewhere).
+fp4_quantize = None
 try:
     if current_platform.is_sm120() or current_platform.is_blackwell():
         from flashinfer import fp4_quantize
     else:
         from sgl_kernel import scaled_fp4_quant as fp4_quantize
-
 except ImportError:
-    fp4_quantize = None
+    pass
 
+# comfy_kitchen cuBLAS NVFP4 backend (optional, Blackwell-only).
+ck_cuda = None
+_ck_available = False
 try:
     import comfy_kitchen.backends.cuda as ck_cuda
 
     _ck_available = True
 except Exception:
-    ck_cuda = None
-    _ck_available = False
+    pass
 
+# FP4 GEMM: prefer flashinfer, fall back to sgl_kernel CUTLASS.
+flashinfer_fp4_gemm = None
+enable_flashinfer_fp4_gemm = False
+cutlass_fp4_gemm = None
 try:
     from flashinfer import mm_fp4 as flashinfer_fp4_gemm
 
@@ -49,7 +54,6 @@ try:
 except ImportError:
     if current_platform.is_cuda():
         from sgl_kernel import cutlass_scaled_fp4_mm as cutlass_fp4_gemm
-    enable_flashinfer_fp4_gemm = False
 
 
 # Initialize logger for the module
@@ -83,9 +87,21 @@ def fp4_gemm(
     backend = FLASHINFER_FP4_GEMM_BACKEND if FLASHINFER_FP4_GEMM_BACKEND else "cudnn"
     if enable_flashinfer_fp4_gemm:
         return flashinfer_fp4_gemm(
-            input, weight, input_sf, weight_sf, alpha, out_dtype, backend=backend, skip_check=False
+            input,
+            weight,
+            input_sf,
+            weight_sf,
+            alpha,
+            out_dtype,
+            backend=backend,
+            skip_check=False,
         )
     else:
+        if cutlass_fp4_gemm is None:
+            raise RuntimeError(
+                "Neither flashinfer nor sgl_kernel.cutlass_scaled_fp4_mm is available. "
+                "Install flashinfer or upgrade sgl_kernel to use fp4_gemm."
+            )
         return cutlass_fp4_gemm(input, weight, input_sf, weight_sf, alpha, out_dtype)
 
 
@@ -206,9 +222,10 @@ class ModelOptQuantConfig(QuantizationConfig):
         from sglang.multimodal_gen.runtime.layers.linear import LinearBase
 
         if isinstance(layer, LinearBase):
-            if is_layer_skipped(
-                prefix, self.exclude_modules, self.packed_modules_mapping
-            ) or self.is_layer_excluded(prefix):
+            if self.is_layer_excluded(prefix) or (
+                self.packed_modules_mapping
+                and is_layer_skipped(prefix, [], self.packed_modules_mapping)
+            ):
                 return UnquantizedLinearMethod()
             return Linear(self)
         return None
@@ -387,11 +404,10 @@ class ModelOptFp4Config(ModelOptQuantConfig):
         return False
 
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
-        return self._get_quant_method(
-            layer,
-            prefix,
-            Linear=ComfyUIFp4LinearMethod,
+        linear_cls = (
+            ComfyUIFp4LinearMethod if _ck_available else ModelOptFp4LinearMethod
         )
+        return self._get_quant_method(layer, prefix, Linear=linear_cls)
 
 
 class ModelOptFp4LinearMethod(LinearMethodBase):
@@ -500,7 +516,6 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         # Store original output size before any padding
         layer.output_size_per_partition = layer.weight.shape[0]
 
-
         # Pad weights for CUTLASS/FlashInfer kernel alignment (K and N divisible by 32)
         weight, weights_padding_cols = pad_nvfp4_weight(layer.weight.data)
         layer.weights_padding_cols = weights_padding_cols
@@ -560,23 +575,24 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
 
         w = layer.weight
         w_scale_interleaved = layer.weight_scale_interleaved
-        # mm_fp4 expects scale factors as raw uint8 bytes; convert here since the
-        # custom op dispatcher may bypass the Python body of fp4_gemm.
-        if w_scale_interleaved.dtype != torch.uint8:
-            w_scale_interleaved = w_scale_interleaved.view(torch.uint8)
-        if x_scale_interleaved.dtype != torch.uint8:
-            x_scale_interleaved = x_scale_interleaved.view(torch.uint8)
-        if enable_flashinfer_fp4_gemm:
-            w = layer.weight.T
-            w_scale_interleaved = w_scale_interleaved.T
-        out = fp4_gemm(
+
+        # Ensure block scales are in fp8 because the CUTLASS kernel rejects uint8
+        if x_scale_interleaved.dtype == torch.uint8:
+            x_scale_interleaved = x_scale_interleaved.view(torch.float8_e4m3fn)
+        if w_scale_interleaved.dtype == torch.uint8:
+            w_scale_interleaved = w_scale_interleaved.view(torch.float8_e4m3fn)
+        if cutlass_fp4_gemm is None:
+            raise RuntimeError(
+                "sgl_kernel.cutlass_scaled_fp4_mm is not available. "
+                "Install or upgrade sgl_kernel to use ModelOptFp4LinearMethod."
+            )
+        out = cutlass_fp4_gemm(
             x_fp4,
             w,
             x_scale_interleaved,
             w_scale_interleaved,
             layer.alpha,
             output_dtype,
-            w_n,
         )
 
         # Slice output to remove N-dimension padding

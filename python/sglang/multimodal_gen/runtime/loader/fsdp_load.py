@@ -153,6 +153,22 @@ def maybe_load_fsdp_model(
             if _is_npu:
                 torch.npu.empty_cache()
 
+    # Fix BFL/ComfyUI → diffusers scale/shift ordering.
+    for param_name in getattr(model, "scale_shift_swap_params", ()):
+        parts = param_name.split(".")
+        module = model
+        for part in parts[:-1]:
+            module = getattr(module, part)
+        param = getattr(module, parts[-1])
+        if param is None:
+            continue
+        half = param.shape[0] // 2
+        with torch.no_grad():
+            first_half = param[:half].clone()
+            param[:half] = param[half:]
+            param[half:] = first_half
+        logger.info("Swapped scale/shift order for %s (BFL → diffusers)", param_name)
+
     for n, p in chain(model.named_parameters(), model.named_buffers()):
         if p.is_meta:
             raise RuntimeError(f"Unexpected param or buffer {n} on meta device.")
@@ -294,20 +310,32 @@ def load_model_from_full_model_state_dict(
         else:
             target_dtype = meta_sharded_param.dtype
 
-        _QUANTIZED_DTYPES = (torch.uint8, torch.float8_e4m3fn, torch.float8_e5m2, torch.int8)
+        _QUANTIZED_DTYPES = (
+            torch.uint8,
+            torch.float8_e4m3fn,
+            torch.float8_e5m2,
+            torch.int8,
+        )
         if full_tensor.dtype != target_dtype:
-            if full_tensor.dtype in _QUANTIZED_DTYPES or target_dtype in _QUANTIZED_DTYPES:
+            if (
+                full_tensor.dtype in _QUANTIZED_DTYPES
+                or target_dtype in _QUANTIZED_DTYPES
+            ):
                 logger.error(
                     "Dtype mismatch for quantized parameter %s: "
                     "checkpoint has %s, model expects %s",
-                    target_param_name, full_tensor.dtype, target_dtype,
+                    target_param_name,
+                    full_tensor.dtype,
+                    target_dtype,
                 )
             else:
                 logger.warning(
                     "Dtype mismatch for %s: checkpoint has %s, model expects %s — casting",
-                    target_param_name, full_tensor.dtype, target_dtype,
+                    target_param_name,
+                    full_tensor.dtype,
+                    target_dtype,
                 )
-            raise Exception(f'dtype mismatch for {target_param_name}')
+            raise Exception(f"dtype mismatch for {target_param_name}")
 
         if not hasattr(meta_sharded_param, "device_mesh"):
             full_tensor = full_tensor.to(device=device, dtype=target_dtype)
@@ -392,6 +420,7 @@ def load_model_from_full_model_state_dict(
         "bias",
         "norm_q",
         "norm_k",
+        "input_scale",  # NVFP4: layers using dynamic activation quantization have no stored input_scale.
     ]
     for new_param_name in unused_keys:
         if not any(pattern in new_param_name for pattern in ALLOWED_NEW_PARAM_PATTERNS):
@@ -409,7 +438,8 @@ def load_model_from_full_model_state_dict(
         meta_sharded_param_dtype = meta_sharded_param.dtype
 
         if any(
-            p in new_param_name for p in ("wcscales", "wtscale", "norm_q", "norm_k")
+            p in new_param_name
+            for p in ("wcscales", "wtscale", "norm_q", "norm_k", "input_scale")
         ):
             init_like = torch.ones_like
         else:

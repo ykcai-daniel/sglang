@@ -579,7 +579,7 @@ def maybe_download_model(
     # Handle "hf://namespace/repo/filename" format: download a single file from a HF repo.
     # repo_id is always "namespace/repo" (2 components), remainder is the filename.
     if model_name_or_path.startswith("hf://"):
-        parts = model_name_or_path[len("hf://"):].split("/", 2)
+        parts = model_name_or_path[len("hf://") :].split("/", 2)
         if len(parts) != 3:
             raise ValueError(
                 f"Invalid hf:// path '{model_name_or_path}'. "
@@ -587,6 +587,9 @@ def maybe_download_model(
             )
         repo_id = f"{parts[0]}/{parts[1]}"
         filename = parts[2]
+        # Accept GitHub/HF web-style references such as hf://namespace/repo/blob/filename.safetensors.
+        if filename.startswith("blob/"):
+            filename = filename[len("blob/") :]
         # Cache-first: try local_files_only before hitting the network.
         try:
             local_path = hf_hub_download(
