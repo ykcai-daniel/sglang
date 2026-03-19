@@ -55,6 +55,7 @@ from sglang.srt.utils.common import (
     is_cuda,
     is_sm120_supported,
     next_power_of_2,
+    round_up_to_multiple,
 )
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.patch_torch import register_fake_if_exists
@@ -159,11 +160,6 @@ CUTEDSL_MOE_SCALAR_INPUT_SCALE = get_bool_env_var(
 
 # FP4 GEMM alignment constant - CUTLASS/FlashInfer kernels require dimensions divisible by 32
 FP4_GEMM_ALIGNMENT = 32
-
-
-def round_up_to_multiple(x: int, m: int) -> int:
-    """Round up x to the nearest multiple of m."""
-    return (x + m - 1) // m * m
 
 
 def pad_nvfp4_weight(
