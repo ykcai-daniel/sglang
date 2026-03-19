@@ -28,7 +28,6 @@ from sglang.srt.layers.quantization.modelopt_quant import (
 from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.layers.utils.common import copy_or_rebind_param
 
-# FP4 activation quantization kernel (flashinfer on Blackwell, sgl_kernel elsewhere).
 fp4_quantize = None
 try:
     if current_platform.is_sm120() or current_platform.is_blackwell():
@@ -38,7 +37,6 @@ try:
 except ImportError:
     pass
 
-# comfy_kitchen cuBLAS NVFP4 backend (optional, Blackwell-only).
 ck_cuda = None
 _ck_available = False
 try:
@@ -48,7 +46,6 @@ try:
 except Exception:
     pass
 
-# CUTLASS FP4 GEMM fallback (when flashinfer is not available).
 cutlass_fp4_gemm = None
 try:
     from flashinfer import mm_fp4 as _flashinfer_fp4_gemm  # noqa: F401
@@ -56,7 +53,6 @@ except ImportError:
     if current_platform.is_cuda():
         from sgl_kernel import cutlass_scaled_fp4_mm as cutlass_fp4_gemm
 
-# Initialize logger for the module
 logger = logging.getLogger(__name__)
 
 
@@ -97,23 +93,15 @@ class ModelOptQuantConfig(QuantizationConfig):
 
     @classmethod
     def override_quantization_method(cls, hf_quant_config, user_quant) -> Optional[str]:
-        """Shared ModelOpt quantization method override logic."""
         if hf_quant_config is None:
             return None
-
-        # Check if this is a ModelOpt config
         quant_algo = hf_quant_config.get("quant_algo", "").upper()
-
-        # If user specified generic "modelopt", auto-detect the specific method
         if user_quant == "modelopt":
             if not ("NVFP4" in quant_algo or "FP4" in quant_algo):
                 logger.warning(
-                    f"Unsupported quant_algo '{quant_algo}' for user_quant 'modelopt'. Using the default 'modelopt_fp4' quant_algo."
+                    f"Unsupported quant_algo '{quant_algo}' for 'modelopt'; defaulting to modelopt_fp4."
                 )
-
-            # The hf_quant_config may be a parsed quant config, so we need to check the quant_method.
             return "modelopt_fp4"
-
         return None
 
 
@@ -180,63 +168,44 @@ class ModelOptFp4Config(ModelOptQuantConfig):
 
     @classmethod
     def from_config(cls, config: Dict[str, Any]) -> ModelOptFp4Config:
-        # Handle two different config formats:
-        # 1. hf_quant_config.json format: {"quantization": {"quant_algo": "NVFP4", ...}}
-        # 2. config.json quantization_config format: {"quant_algo": "NVFP4", ...}
-        # In future modelopt will deprecate hf_quant_config.json, and only keep config.json.
-        # For legacy reasons, we keep hf_quant_config.json for now.
-
-        # Initialize variables
         group_size = None
         exclude_modules = []
 
-        # Try flat format first (config.json quantization_config - preferred format)
+        # Flat format (config.json quantization_config)
         quant_method = config.get("quant_algo")
         if quant_method is not None:
             group_size = config.get("group_size")
-            # If group_size is not at top level, try to extract from config_groups
             if group_size is None:
                 config_groups = config.get("config_groups", {})
                 if config_groups:
-                    # Get group_size from the first group's weights config
                     first_group = next(iter(config_groups.values()), {})
-                    weights_config = first_group.get("weights", {})
-                    group_size = weights_config.get("group_size")
-
+                    group_size = first_group.get("weights", {}).get("group_size")
             exclude_modules = config.get("ignore", [])
         else:
-            # Fall back to nested format (hf_quant_config.json - legacy format)
+            # Nested format (hf_quant_config.json)
             try:
                 quant_config = cls.get_from_keys(config, ["quantization"])
                 quant_method = quant_config["quant_algo"]
                 group_size = ModelOptFp4Config.common_group_size(config)
                 exclude_modules = quant_config.get("exclude_modules", [])
             except (ValueError, KeyError):
-                raise ValueError(
-                    "Cannot find 'quant_algo' in the model's quantization config. "
-                    "Expected either flat format (config.json) or nested format (hf_quant_config.json)."
-                )
+                raise ValueError("Cannot find 'quant_algo' in quantization config.")
 
-        if not quant_method in ["NVFP4"]:
+        if quant_method not in ["NVFP4"]:
             raise ValueError(
-                f"ModelOpt currently only supports: NVFP4 quantization in sglang diffusion. The provided quant_algo is {quant_method}. Please check the "
-                "quantization config for your model's configuration."
+                f"Only NVFP4 quantization is supported for diffusion, got '{quant_method}'."
             )
-        is_checkpoint_nvfp4_serialized = "NVFP4" in quant_method
 
         if group_size is None or exclude_modules is None:
-            logger.warning(
-                f"group_size: {group_size}," f"exclude_modules: {exclude_modules}"
-            )
             raise ValueError(
                 "NVFP4 quantization requires group_size and exclude_modules "
-                "specified in the quantization config"
+                "in the quantization config"
             )
         return cls(
-            is_checkpoint_nvfp4_serialized,
-            group_size,
-            exclude_modules,
-            config.get("packed_modules_mapping"),
+            is_checkpoint_nvfp4_serialized=True,
+            group_size=group_size,
+            exclude_modules=exclude_modules,
+            packed_modules_mapping=config.get("packed_modules_mapping"),
         )
 
     def is_layer_excluded(self, prefix: str):
@@ -253,9 +222,6 @@ class ModelOptFp4Config(ModelOptQuantConfig):
                 pattern_split[-1] in fused_patterns
                 and pattern_split[-1] in prefix_split[-1]
             ):
-                # Check if the last part of the excluded pattern is contained in the last part of the prefix
-                # This handles fused modules like fused_qkv_a_proj_with_mqa that contain q_a_proj and kv_a_proj_with_mqa
-                # e.g., model.layers.{i}.self_attn.{fused_weight_name}
                 assert len(prefix_split) == 5 and len(pattern_split) == 5
                 return True
         return False
@@ -268,19 +234,7 @@ class ModelOptFp4Config(ModelOptQuantConfig):
 
 
 class ModelOptFp4LinearMethod(LinearMethodBase):
-    """Linear method for NVFP4.
-    Supports loading NVFP4 checkpoints with the following structure:
-
-    |Tensor Name           | datatype      |  shape      |
-    |----------------------------------------------------|
-    |input_scale           | torch.float32 | scalar      |
-    |weight                | NVFP4(SE2M1)  | [1, X, y/2] |
-    |weight_scale          | FP8-E4M3      | [X, Y]      |
-    |weight_scale_2        | torch.float32 | scalar      |
-
-    The weights are quantized per block of 16 elements.
-    Args: quant_config: The ModelOpt quantization config.
-    """
+    """NVFP4 linear method using CUTLASS FP4 GEMM."""
 
     def __init__(self, quant_config: ModelOptFp4Config):
         self.quant_config = quant_config
@@ -322,7 +276,6 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
 
         weight = ModelWeightParameter(
             data=torch.empty(
-                # 2 fp4 data is packed in one uint8 in the input dimension
                 output_size_per_partition,
                 input_size_per_partition // 2,
                 dtype=torch.uint8,
@@ -370,15 +323,11 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
             layer, "input_scale_inv", (1 / input_scale_2).to(torch.float32)
         )
 
-        # Store original output size before any padding
         layer.output_size_per_partition = layer.weight.shape[0]
-
-        # Pad weights for CUTLASS/FlashInfer kernel alignment (K and N divisible by 32)
         weight, weights_padding_cols = pad_nvfp4_weight(layer.weight.data)
         layer.weights_padding_cols = weights_padding_cols
         copy_or_rebind_param(layer, "weight", weight)
 
-        # Pad and blockwise interleave weight_scale
         scales = layer.weight_scale
         scale_ndim = scales.ndim
         if scale_ndim == 2:
@@ -409,30 +358,19 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         output_dtype = x.dtype
-        # Support arbitrary leading batch dimensions (e.g. [B, S, K] or [M, K])
         input_shape = x.shape
         x = x.view(-1, input_shape[-1])
 
-        # Get original output size (before padding) and padded weight size
         output_size = layer.output_size_per_partition
         output_shape = list(input_shape[:-1]) + [output_size]
 
-        # Quantize BF16 or FP16 to (FP4 and interleaved block scale)
         x_fp4, x_scale_interleaved = fp4_quantize(x, layer.input_scale_inv)
-
-        assert x_fp4.dtype == torch.uint8
-        assert layer.weight.dtype == torch.uint8
-        assert layer.weight_scale_interleaved.dtype == torch.float8_e4m3fn
-        assert layer.alpha.dtype == torch.float32
-
-        # Pad activations to match weight K-dimension padding
         weights_padding_cols = getattr(layer, "weights_padding_cols", 0)
         x_fp4 = pad_nvfp4_activation_for_cutlass(x_fp4, weights_padding_cols)
 
         w = layer.weight
         w_scale_interleaved = layer.weight_scale_interleaved
 
-        # Ensure block scales are in fp8 because the CUTLASS kernel rejects uint8
         if x_scale_interleaved.dtype == torch.uint8:
             x_scale_interleaved = x_scale_interleaved.view(torch.float8_e4m3fn)
         if w_scale_interleaved.dtype == torch.uint8:
@@ -451,7 +389,6 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
             output_dtype,
         )
 
-        # Slice output to remove N-dimension padding
         out = slice_nvfp4_output(out, output_size)
 
         if bias is not None:
@@ -460,20 +397,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
 
 
 class ComfyUIFp4LinearMethod(LinearMethodBase):
-    """Linear method for NVFP4 using comfy-kitchen (cuBLAS) kernels.
-
-    Same checkpoint format as ModelOptFp4LinearMethod, but uses
-    comfy_kitchen.scaled_mm_nvfp4 for the GEMM instead of flashinfer/CUTLASS.
-
-    Alignment requirements (less strict than CUTLASS):
-      - Weight N dimension: multiple of 8
-      - Weight K dimension: multiple of 16
-
-    Block scale format: cuBLAS swizzled layout
-      [roundup(N, 128), roundup(K//16, 4)] in fp8_e4m3fn
-
-    Requires SM >= 10.0 (Blackwell) for hardware-accelerated matmul.
-    """
+    """NVFP4 linear method using comfy-kitchen cuBLAS kernels (Blackwell)."""
 
     def __init__(self, quant_config: ModelOptFp4Config):
         self.quant_config = quant_config
@@ -549,38 +473,21 @@ class ComfyUIFp4LinearMethod(LinearMethodBase):
         input_scale = layer.input_scale.max().to(torch.float32)
         weight_scale_2 = layer.weight_scale_2.max().to(torch.float32)
 
-        # Store scalar per-tensor scales on CUDA for the kernel
         copy_or_rebind_param(layer, "input_scale_ck", input_scale.cuda())
         copy_or_rebind_param(layer, "weight_scale_2_ck", weight_scale_2.cuda())
-
-        # Store original output size (N) before any padding
         layer.output_size_per_partition = layer.weight.shape[0]
-
-        # Ensure weight is contiguous on CUDA
         copy_or_rebind_param(layer, "weight", layer.weight.data.contiguous().cuda())
 
-        # The checkpoint's weight_scale is already in cuBLAS tiled layout —
-        # modelopt quantizes using NVIDIA's cuBLAS FP4 kernel, which writes
-        # block scales in the hardware-native tiled format directly.
-        # Therefore we must NOT apply an additional swizzle (unlike the
-        # flashinfer path which converts cuBLAS-tiled → CUTLASS format).
-        #
-        # cuBLAS tiled format shape requirement:
-        #   (roundup(N, 128), roundup(K//16, 4))
-        #
-        # If dimensions are already aligned (common for FLUX), use as-is.
-        # Otherwise: unswizzle → pad → re-swizzle so the padding zeros end
-        # up in the correct tiled positions.
-        scales = layer.weight_scale.data  # [N, K//16] fp8_e4m3fn
+        # Checkpoint block scales are already in cuBLAS tiled layout.
+        # Pad to (roundup(N, 128), roundup(K//16, 4)) if needed.
+        scales = layer.weight_scale.data
         N, Ks = scales.shape
         N_padded = round_up(N, 128)
         Ks_padded = round_up(Ks, 4)
 
         if N == N_padded and Ks == Ks_padded:
-            # Already aligned — use the checkpoint block scales directly
             weight_scale_ck = scales.cuda()
         else:
-            # Unswizzle (cuBLAS tiled → row-major), zero-pad, re-swizzle
             scales_rm = from_blocked(scales, num_rows=N, num_cols=Ks)
             padded_rm = torch.zeros((N_padded, Ks_padded), dtype=scales.dtype)
             padded_rm[:N, :Ks] = scales_rm
@@ -611,16 +518,10 @@ class ComfyUIFp4LinearMethod(LinearMethodBase):
         if not x_2d.is_contiguous():
             x_2d = x_2d.contiguous()
 
-        # Quantize BF16/FP16 activation to NVFP4 with cuBLAS block-scale layout.
-        # pad_16x=True pads M and K to multiples of 16 (K already satisfies this).
-        # Returns:
-        #   x_fp4:        [roundup(M, 16), K//2]                  uint8
-        #   x_block_scale:[roundup(roundup(M,16), 128), roundup(K//16, 4)]  fp8_e4m3fn
         x_fp4, x_block_scale = ck_cuda.quantize_nvfp4(
             x_2d, layer.input_scale_ck, pad_16x=True
         )
 
-        # cuBLAS NVFP4 GEMM: computes (x_fp4 @ weight.T) * alpha + bias
         out = ck_cuda.scaled_mm_nvfp4(
             x_fp4,
             layer.weight,
@@ -631,7 +532,6 @@ class ComfyUIFp4LinearMethod(LinearMethodBase):
             bias=bias,
             out_dtype=output_dtype,
         )
-        # out: [roundup(M, 16), N] — slice back to original [M, output_size]
         out = out[:M, :output_size].contiguous()
 
         return out.view(*output_shape)

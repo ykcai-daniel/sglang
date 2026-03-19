@@ -297,19 +297,11 @@ def _get_config_info(
             return _CONFIG_REGISTRY.get(model_id)
 
     # 3. Use detectors
-    pipeline_name = ""
-    try:
-        if os.path.exists(model_path):
-            config = verify_model_config_and_directory(model_path)
-        else:
-            config = maybe_download_model_index(model_path)
-        pipeline_name = config.get("_class_name", "").lower()
-    except Exception:
-        logger.debug(
-            "Could not load model_index.json for '%s'; relying on path-based detectors",
-            model_path,
-            exc_info=True,
-        )
+    if os.path.exists(model_path):
+        config = verify_model_config_and_directory(model_path)
+    else:
+        config = maybe_download_model_index(model_path)
+    pipeline_name = config.get("_class_name", "").lower()
 
     matched_model_names = []
     for model_id, detector in _MODEL_NAME_DETECTORS:
