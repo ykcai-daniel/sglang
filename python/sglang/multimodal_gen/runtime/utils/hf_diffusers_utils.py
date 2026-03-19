@@ -565,9 +565,7 @@ def maybe_download_model(
     Check if the model path is a Hugging Face Hub model ID and download it if needed.
 
     Args:
-        model_name_or_path: Local path or Hugging Face Hub model ID. Supports
-            "repo_id::filename" syntax to download a single file from a repo
-            (e.g. "black-forest-labs/FLUX.2-dev-NVFP4::flux2-dev-nvfp4-mixed.safetensors").
+        model_name_or_path: Local path or Hugging Face Hub model ID
         local_dir: Local directory to save the model
         download: Whether to download the model from Hugging Face Hub
         is_lora: If True, skip model completeness verification (LoRA models don't have transformer/vae directories)
@@ -575,36 +573,6 @@ def maybe_download_model(
     Returns:
         Local path to the model
     """
-
-    # Handle "hf://namespace/repo/filename" format: download a single file from a HF repo.
-    # repo_id is always "namespace/repo" (2 components), remainder is the filename.
-    if model_name_or_path.startswith("hf://"):
-        parts = model_name_or_path[len("hf://") :].split("/", 2)
-        if len(parts) != 3:
-            raise ValueError(
-                f"Invalid hf:// path '{model_name_or_path}'. "
-                "Expected format: hf://namespace/repo/filename"
-            )
-        repo_id = f"{parts[0]}/{parts[1]}"
-        filename = parts[2]
-        # Cache-first: try local_files_only before hitting the network.
-        try:
-            local_path = hf_hub_download(
-                repo_id, filename, local_dir=local_dir, local_files_only=True
-            )
-            logger.info("Found %s in cache at %s", filename, local_path)
-            return str(local_path)
-        except Exception:
-            pass
-        if not download:
-            raise ValueError(
-                f"File '{filename}' from repo '{repo_id}' not found in cache "
-                "and download=False."
-            )
-        logger.info("Downloading %s from %s...", filename, repo_id)
-        local_path = hf_hub_download(repo_id, filename, local_dir=local_dir)
-        logger.info("Downloaded %s to %s", filename, local_path)
-        return str(local_path)
 
     # 1. Local path check: if path exists locally, verify it's complete (skip for LoRA)
     if os.path.exists(model_name_or_path):
