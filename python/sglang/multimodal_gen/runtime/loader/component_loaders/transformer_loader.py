@@ -106,7 +106,7 @@ class TransformerLoader(ComponentLoader):
                 )
                 if quant_config:
                     return quant_config
-        return None
+        return quant_config
 
     def _resolve_target_param_dtype(
         self,
