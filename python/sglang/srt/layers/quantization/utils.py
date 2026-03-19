@@ -11,7 +11,6 @@ import numpy
 import torch
 
 from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
-from sglang.srt.utils.common import round_up
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -85,12 +84,12 @@ def is_layer_skipped(
             if prefix_gate in ignored_layers and prefix_up in ignored_layers:
                 is_skipped = True
         elif "experts" in prefix:
-            # Expert names can include full module paths; keep coarse prefix matches
-            # (e.g., "model.layers.{i}.") while also checking expert-specific entries.
-            is_skipped = is_skipped or any(
-                prefix in layer_name
-                for layer_name in ignored_layers
-                if "experts" in layer_name
+            is_skipped = any(
+                [
+                    prefix in layer_name
+                    for layer_name in ignored_layers
+                    if "experts" in layer_name
+                ]
             )
 
     assert is_skipped is not None
@@ -577,8 +576,9 @@ def swizzle_blockscale(scale: torch.Tensor):
         scale = scale.unsqueeze(0)
     assert scale.ndim == 3
     B, M, K = scale.shape
-    M_padded = round_up(M, 128)
-    K_padded = round_up(K, 4)
+    round_up_multiple = lambda x, m: (x + m - 1) // m * m
+    M_padded = round_up_multiple(M, 128)
+    K_padded = round_up_multiple(K, 4)
     padded_scale = torch.zeros((B, M_padded, K_padded), dtype=scale.dtype)
     padded_scale[:B, :M, :K] = scale
     batches, rows, cols = padded_scale.shape
@@ -591,12 +591,6 @@ def swizzle_blockscale(scale: torch.Tensor):
         swizzled_scale.reshape(M_padded, K_padded)
         if scale_ndim == 2
         else swizzled_scale.reshape(B, M_padded, K_padded)
-    )
-
-
-def swap_w13_to_w31(x: torch.Tensor) -> torch.Tensor:
-    return (
-        x.reshape(-1, 2, x.shape[-2] // 2, x.shape[-1]).flip(dims=[1]).reshape(x.shape)
     )
 
 
