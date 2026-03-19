@@ -46,12 +46,20 @@ try:
 except Exception:
     pass
 
+flashinfer_mm_fp4 = None
 cutlass_fp4_gemm = None
-if current_platform.is_cuda():
-    try:
-        from sgl_kernel import cutlass_scaled_fp4_mm as cutlass_fp4_gemm
-    except ImportError:
-        pass
+_use_flashinfer_fp4 = False
+try:
+    from flashinfer import mm_fp4 as flashinfer_mm_fp4
+
+    _use_flashinfer_fp4 = True
+    _fp4_gemm_backend = "cudnn" if current_platform.is_blackwell() else "auto"
+except ImportError:
+    if current_platform.is_cuda():
+        try:
+            from sgl_kernel import cutlass_scaled_fp4_mm as cutlass_fp4_gemm
+        except ImportError:
+            pass
 
 logger = logging.getLogger(__name__)
 
@@ -324,7 +332,11 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         )
 
         layer.output_size_per_partition = layer.weight.shape[0]
-        weight, weights_padding_cols = pad_nvfp4_weight(layer.weight.data)
+
+        # Swap nibbles: (byte >> 4) | (byte << 4).
+        w = layer.weight.data
+        w_swapped = ((w >> 4) | (w << 4)).contiguous()
+        weight, weights_padding_cols = pad_nvfp4_weight(w_swapped)
         layer.weights_padding_cols = weights_padding_cols
         copy_or_rebind_param(layer, "weight", weight)
 
@@ -338,11 +350,6 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         K_padded = round_up(K, 4)
         padded_scales = torch.zeros((B, M_padded, K_padded), dtype=scales.dtype)
         padded_scales[:B, :M, :K] = scales
-        batches, rows, cols = padded_scales.shape
-        assert rows % 128 == 0
-        assert cols % 4 == 0
-        padded_scales = padded_scales.reshape(batches, rows // 128, 4, 32, cols // 4, 4)
-        padded_scales = padded_scales.permute((0, 1, 4, 3, 2, 5))
         padded_scales = padded_scales.contiguous().cuda()
         padded_scales = (
             padded_scales.reshape(M_padded, K_padded)
@@ -375,19 +382,29 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
             x_scale_interleaved = x_scale_interleaved.view(torch.float8_e4m3fn)
         if w_scale_interleaved.dtype == torch.uint8:
             w_scale_interleaved = w_scale_interleaved.view(torch.float8_e4m3fn)
-        if cutlass_fp4_gemm is None:
-            raise RuntimeError(
-                "sgl_kernel.cutlass_scaled_fp4_mm is not available. "
-                "Install or upgrade sgl_kernel to use ModelOptFp4LinearMethod."
+        if _use_flashinfer_fp4:
+            out = flashinfer_mm_fp4(
+                x_fp4,
+                w.T,
+                x_scale_interleaved,
+                w_scale_interleaved.T,
+                layer.alpha,
+                output_dtype,
+                backend=_fp4_gemm_backend,
             )
-        out = cutlass_fp4_gemm(
-            x_fp4,
-            w,
-            x_scale_interleaved,
-            w_scale_interleaved,
-            layer.alpha,
-            output_dtype,
-        )
+        elif cutlass_fp4_gemm is not None:
+            out = cutlass_fp4_gemm(
+                x_fp4,
+                w,
+                x_scale_interleaved,
+                w_scale_interleaved,
+                layer.alpha,
+                output_dtype,
+            )
+        else:
+            raise RuntimeError(
+                "No FP4 GEMM kernel available. Install flashinfer or sgl_kernel."
+            )
 
         out = slice_nvfp4_output(out, output_size)
 
