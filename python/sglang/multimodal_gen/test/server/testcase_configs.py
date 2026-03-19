@@ -419,15 +419,6 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
         ),
         T2I_sampling_params,
     ),
-    DiffusionTestCase(
-        "flux_2_nvfp4_t2i",
-        DiffusionServerArgs(
-            model_path="black-forest-labs/FLUX.2-dev",
-            modality="image",
-            extras=["--transformer-model-path black-forest-labs/FLUX.2-dev-NVFP4"],
-        ),
-        T2I_sampling_params,
-    ),
     # TODO: replace with a faster model to test the --dit-layerwise-offload
     # TODO: currently, we don't support sending more than one request in test, and setting `num_outputs_per_prompt` to 2 doesn't guarantee the denoising be executed twice,
     # so we do one warmup and send one request instead
@@ -754,6 +745,18 @@ if not current_platform.is_hip():
             ),
         )
     )
+
+# TODO: enable on 4090/5090/b200
+ONE_GPU_CASES_C = [
+    DiffusionTestCase(
+        "flux_2_nvfp4_t2i",
+        DiffusionServerArgs(
+            model_path="black-forest-labs/FLUX.2-dev-NVFP4",
+            modality="image",
+        ),
+        T2I_sampling_params,
+    )
+]
 
 TWO_GPU_CASES_A = [
     DiffusionTestCase(
