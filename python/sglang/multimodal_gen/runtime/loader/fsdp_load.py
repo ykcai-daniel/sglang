@@ -316,7 +316,8 @@ def load_model_from_full_model_state_dict(
                 )
             else:
                 logger.warning(
-                    "Dtype mismatch for %s: checkpoint has %s, model expects %s.",
+                    "Dtype mismatch for %s: checkpoint has %s, model expects %s. "
+                    "Casting checkpoint tensor to the target dtype during load.",
                     target_param_name,
                     full_tensor.dtype,
                     target_dtype,
