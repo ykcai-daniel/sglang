@@ -255,6 +255,14 @@ def get_model_short_name(model_id: str) -> str:
         return model_id
 
 
+def _normalize_hf_cache_path(path: str) -> str:
+    """Normalize a local HuggingFace cache path before substring matching.
+
+    We match registered repo ids like ``org/repo`` against cache fragments like ``models--org--repo`` that appear in snapshot/blob paths.
+    """
+    return os.path.normpath(path).lower().replace("\\", "/")
+
+
 @lru_cache(maxsize=1)
 def _get_config_info(
     model_path: str, model_id: Optional[str] = None
@@ -292,6 +300,27 @@ def _get_config_info(
         if registered_model_name in model_short_name:
             logger.debug(
                 f"Resolved model name '{registered_model_hf_id}' from partial path match."
+            )
+            model_id = _MODEL_HF_PATH_TO_NAME[registered_model_hf_id]
+            return _CONFIG_REGISTRY.get(model_id)
+
+    # 2b. Match local HuggingFace cache snapshot/blob paths such as:
+    #   .../models--org--repo/snapshots/<hash>
+    # This lets users pass a local HF cache snapshot directory directly even
+    # when its basename is only the snapshot hash.
+    # Example:
+    #    /xxx/models--black-forest-labs--FLUX.2-dev-NVFP4/snapshots/142b87e70bc3006937b7093d89ff287b5f59f071
+    # -> models--black-forest-labs--flux.2-dev-nvfp4 (to match with cache_repo_fragment)
+    normalized_model_path = _normalize_hf_cache_path(model_path)
+    for registered_model_hf_id in all_model_hf_paths:
+        cache_repo_fragment = (
+            f"models--{registered_model_hf_id.lower().replace('/', '--')}"
+        )
+        if cache_repo_fragment in normalized_model_path:
+            logger.debug(
+                "Resolved HuggingFace cache path '%s' to registered model '%s'.",
+                model_path,
+                registered_model_hf_id,
             )
             model_id = _MODEL_HF_PATH_TO_NAME[registered_model_hf_id]
             return _CONFIG_REGISTRY.get(model_id)

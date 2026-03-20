@@ -228,7 +228,7 @@ def shard_model(
     fully_shard(model, **fsdp_kwargs)
 
 
-# TODO(PY): device mesh for cfg parallel
+# TODO(mick): need refactor, to move out checkpoint-specific adjustments
 def load_model_from_full_model_state_dict(
     model: FSDPModule | torch.nn.Module,
     full_sd_iterator: Generator[tuple[str, torch.Tensor], None, None],
