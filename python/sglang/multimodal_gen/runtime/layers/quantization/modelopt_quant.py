@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+from functools import lru_cache
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -28,40 +29,27 @@ from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.layers.utils.common import copy_or_rebind_param
 from sglang.srt.utils.common import round_up
 
-fp4_quantize = None
-try:
-    if current_platform.is_sm120() or current_platform.is_blackwell():
-        from flashinfer import fp4_quantize
-    else:
-        from sgl_kernel import scaled_fp4_quant as fp4_quantize
-except ImportError:
-    pass
-
-ck_cuda = None
-_ck_available = False
-try:
-    import comfy_kitchen.backends.cuda as ck_cuda
-
-    _ck_available = True
-except Exception:
-    pass
-
-flashinfer_mm_fp4 = None
-cutlass_fp4_gemm = None
-_use_flashinfer_fp4 = False
-try:
-    from flashinfer import mm_fp4 as flashinfer_mm_fp4
-
-    _use_flashinfer_fp4 = True
-    _fp4_gemm_backend = "cudnn" if current_platform.is_blackwell() else "auto"
-except ImportError:
-    if current_platform.is_cuda():
-        try:
-            from sgl_kernel import cutlass_scaled_fp4_mm as cutlass_fp4_gemm
-        except ImportError:
-            pass
-
 logger = logging.getLogger(__name__)
+
+
+@lru_cache(maxsize=1)
+def _get_fp4_quantize_op():
+    return current_platform.get_modelopt_fp4_quantize_op()
+
+
+@lru_cache(maxsize=1)
+def _get_fp4_gemm_op():
+    return current_platform.get_modelopt_fp4_gemm_op()
+
+
+@lru_cache(maxsize=1)
+def _get_comfy_kitchen_cuda_backend():
+    try:
+        import comfy_kitchen.backends.cuda as ck_cuda
+
+        return ck_cuda
+    except Exception:
+        return None
 
 
 class ModelOptQuantConfig(QuantizationConfig):
@@ -235,9 +223,11 @@ class ModelOptFp4Config(ModelOptQuantConfig):
         return False
 
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
-        linear_cls = (
-            ComfyUIFp4LinearMethod if _ck_available else ModelOptFp4LinearMethod
-        )
+        if current_platform.should_use_modelopt_fp4_best_performance_kit():
+            linear_cls = ComfyUIFp4LinearMethod
+        else:
+            current_platform.warn_if_modelopt_fp4_best_performance_kit_missing()
+            linear_cls = ModelOptFp4LinearMethod
         return self._get_quant_method(layer, prefix, Linear=linear_cls)
 
 
@@ -371,6 +361,12 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         output_size = layer.output_size_per_partition
         output_shape = list(input_shape[:-1]) + [output_size]
 
+        fp4_quantize = _get_fp4_quantize_op()
+        if fp4_quantize is None:
+            raise RuntimeError(
+                "No FP4 quantization kernel available. Install flashinfer or sgl_kernel."
+            )
+
         x_fp4, x_scale_interleaved = fp4_quantize(x, layer.input_scale_inv)
         weights_padding_cols = getattr(layer, "weights_padding_cols", 0)
         x_fp4 = pad_nvfp4_activation_for_cutlass(x_fp4, weights_padding_cols)
@@ -382,18 +378,19 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
             x_scale_interleaved = x_scale_interleaved.view(torch.float8_e4m3fn)
         if w_scale_interleaved.dtype == torch.uint8:
             w_scale_interleaved = w_scale_interleaved.view(torch.float8_e4m3fn)
-        if _use_flashinfer_fp4:
-            out = flashinfer_mm_fp4(
+        fp4_gemm, flashinfer_backend = _get_fp4_gemm_op()
+        if flashinfer_backend is not None:
+            out = fp4_gemm(
                 x_fp4,
                 w.T,
                 x_scale_interleaved,
                 w_scale_interleaved.T,
                 layer.alpha,
                 output_dtype,
-                backend=_fp4_gemm_backend,
+                backend=flashinfer_backend,
             )
-        elif cutlass_fp4_gemm is not None:
-            out = cutlass_fp4_gemm(
+        elif fp4_gemm is not None:
+            out = fp4_gemm(
                 x_fp4,
                 w,
                 x_scale_interleaved,
@@ -518,10 +515,11 @@ class ComfyUIFp4LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if not _ck_available:
+        ck_cuda = _get_comfy_kitchen_cuda_backend()
+        if ck_cuda is None:
             raise RuntimeError(
                 "comfy_kitchen is not available. "
-                "Install it to use ModelOptFp4CKLinearMethod."
+                "Install it to use ComfyUIFp4LinearMethod."
             )
 
         output_dtype = x.dtype
