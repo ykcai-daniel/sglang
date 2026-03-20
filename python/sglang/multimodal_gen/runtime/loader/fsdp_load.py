@@ -153,22 +153,7 @@ def maybe_load_fsdp_model(
             quant_method.process_weights_after_loading(module)
             if _is_npu:
                 torch.npu.empty_cache()
-
-    # Fix BFL/ComfyUI → diffusers scale/shift ordering.
-    for param_name in getattr(model, "scale_shift_swap_params", ()):
-        parts = param_name.split(".")
-        module = model
-        for part in parts[:-1]:
-            module = getattr(module, part)
-        param = getattr(module, parts[-1])
-        if param is None:
-            continue
-        half = param.shape[0] // 2
-        with torch.no_grad():
-            first_half = param[:half].clone()
-            param[:half] = param[half:]
-            param[half:] = first_half
-        logger.info("Swapped scale/shift order for %s (BFL → diffusers)", param_name)
+    model.post_load_weights()
 
     for n, p in chain(model.named_parameters(), model.named_buffers()):
         if p.is_meta:
@@ -413,38 +398,50 @@ def load_model_from_full_model_state_dict(
     if unused_keys:
         logger.warning("Found unloaded parameters in meta state dict: %s", unused_keys)
 
-    # for nunchaku; norm_q/norm_k for SANA QK normalization layers
-    ALLOWED_NEW_PARAM_PATTERNS = [
+    # Legacy allowlist for parameter families synthesized after loading.
+    # New formats should declare missing_param_init on the parameter instead.
+    LEGACY_ALLOWED_NEW_PARAM_PATTERNS = [
         "gate_compress",
         "wcscales",
         "wtscale",
         "bias",
         "norm_q",
         "norm_k",
-        "input_scale",  # NVFP4: layers using dynamic activation quantization have no stored input_scale.
     ]
     for new_param_name in unused_keys:
-        if not any(pattern in new_param_name for pattern in ALLOWED_NEW_PARAM_PATTERNS):
+        meta_sharded_param = meta_sd.get(new_param_name)
+        meta_sharded_param_dtype = meta_sharded_param.dtype
+        actual_param = param_dict.get(new_param_name)
+        missing_param_init = (
+            getattr(actual_param, "missing_param_init", None)
+            if actual_param is not None
+            else None
+        )
+
+        if missing_param_init is None and not any(
+            pattern in new_param_name for pattern in LEGACY_ALLOWED_NEW_PARAM_PATTERNS
+        ):
             logger.error(
-                "Unsupported new parameter: %s. Allowed patterns: %s",
+                "Unsupported new parameter: %s. Allowed legacy patterns: %s",
                 new_param_name,
-                ALLOWED_NEW_PARAM_PATTERNS,
+                LEGACY_ALLOWED_NEW_PARAM_PATTERNS,
             )
             raise ValueError(
                 f"New parameter '{new_param_name}' is not supported. "
-                f"Currently only parameters containing {ALLOWED_NEW_PARAM_PATTERNS} are allowed."
+                "Checkpoint-specific synthesized parameters should either match "
+                f"{LEGACY_ALLOWED_NEW_PARAM_PATTERNS} or declare missing_param_init."
             )
 
-        meta_sharded_param = meta_sd.get(new_param_name)
-        meta_sharded_param_dtype = meta_sharded_param.dtype
-
-        if any(
-            p in new_param_name
-            for p in ("wcscales", "wtscale", "norm_q", "norm_k", "input_scale")
+        if missing_param_init == "ones" or any(
+            p in new_param_name for p in ("wcscales", "wtscale", "norm_q", "norm_k")
         ):
             init_like = torch.ones_like
-        else:
+        elif missing_param_init == "zeros" or missing_param_init is None:
             init_like = torch.zeros_like
+        else:
+            raise ValueError(
+                f"Unsupported missing_param_init={missing_param_init!r} for {new_param_name}"
+            )
 
         if not hasattr(meta_sharded_param, "device_mesh"):
             sharded_tensor = init_like(

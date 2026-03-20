@@ -55,7 +55,7 @@ def _get_qkv_projections(
 
     encoder_query = encoder_key = encoder_value = None
     if encoder_hidden_states is not None and attn.added_kv_proj_dim is not None:
-        if getattr(attn, "use_fused_added_qkv", False):
+        if attn.use_fused_added_qkv:
             added_qkv, _ = attn.to_added_qkv(encoder_hidden_states)
             encoder_query, encoder_key, encoder_value = [
                 t.contiguous() for t in added_qkv.chunk(3, dim=-1)
@@ -783,6 +783,26 @@ class Flux2Transformer2DModel(CachableDiT, OffloadableDiTMixin):
 
     param_names_mapping = FluxConfig().arch_config.param_names_mapping
     scale_shift_swap_params = ("norm_out.linear.weight", "norm_out.linear.bias")
+
+    def post_load_weights(self) -> None:
+        # BFL/ComfyUI checkpoints store AdaLN modulation params as [scale, shift],
+        # while diffusers expects [shift, scale].
+        for param_name in self.scale_shift_swap_params:
+            parts = param_name.split(".")
+            module = self
+            for part in parts[:-1]:
+                module = getattr(module, part)
+            param = getattr(module, parts[-1], None)
+            if param is None:
+                continue
+            half = param.shape[0] // 2
+            with torch.no_grad():
+                first_half = param[:half].clone()
+                param[:half] = param[half:]
+                param[half:] = first_half
+            logger.info(
+                "Swapped scale/shift order for %s (BFL → diffusers)", param_name
+            )
 
     def __init__(
         self,

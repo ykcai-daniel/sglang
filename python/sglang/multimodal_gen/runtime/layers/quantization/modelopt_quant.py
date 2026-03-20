@@ -19,6 +19,7 @@ from sglang.multimodal_gen.runtime.models.parameter import (
     ModelWeightParameter,
     PerTensorScaleParameter,
 )
+from sglang.multimodal_gen.runtime.models.utils import set_weight_attrs
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.srt.layers.quantization.modelopt_quant import (
     pad_nvfp4_activation_for_cutlass,
@@ -288,7 +289,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
             data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
             weight_loader=weight_loader,
         )
-
+        set_weight_attrs(input_scale, {"missing_param_init": "ones"})
         layer.register_parameter("input_scale", input_scale)
 
         weight_scale_2 = PerTensorScaleParameter(
@@ -461,6 +462,7 @@ class ComfyUIFp4LinearMethod(LinearMethodBase):
             data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
             weight_loader=weight_loader,
         )
+        set_weight_attrs(input_scale, {"missing_param_init": "ones"})
         layer.register_parameter("input_scale", input_scale)
 
         weight_scale_2 = PerTensorScaleParameter(
