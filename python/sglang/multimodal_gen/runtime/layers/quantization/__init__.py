@@ -62,14 +62,6 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
     return method_to_config[quantization]
 
 
-def get_quantization_dtype(quantization: str) -> str:
-    """Extract ModelOpt quantization type from unified quantization flag."""
-    if quantization == "modelopt_fp4":
-        return "NVFP4"
-    else:
-        return quantization
-
-
 __all__ = [
     "QuantizationMethods",
     "QuantizationConfig",
