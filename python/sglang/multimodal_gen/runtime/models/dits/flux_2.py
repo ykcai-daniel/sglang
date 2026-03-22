@@ -21,9 +21,14 @@ from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from diffusers.models.normalization import AdaLayerNormContinuous
 
 from sglang.multimodal_gen.configs.models.dits.flux import FluxConfig
+from sglang.multimodal_gen.runtime.distributed import divide, get_tp_world_size
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm, apply_qk_norm
-from sglang.multimodal_gen.runtime.layers.linear import ColumnParallelLinear
+from sglang.multimodal_gen.runtime.layers.linear import (
+    ColumnParallelLinear,
+    MergedColumnParallelLinear,
+    RowParallelLinear,
+)
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
 )
@@ -101,20 +106,20 @@ class Flux2FeedForward(nn.Module):
         dim_out = dim_out or dim
 
         # Flux2SwiGLU will reduce the dimension by half
-        self.linear_in = ColumnParallelLinear(
+        self.linear_in = MergedColumnParallelLinear(
             dim,
-            inner_dim * 2,
+            [inner_dim, inner_dim],
             bias=bias,
-            gather_output=True,
+            gather_output=False,
             quant_config=quant_config,
             prefix=f"{prefix}.linear_in" if prefix else "linear_in",
         )
         self.act_fn = Flux2SwiGLU()
-        self.linear_out = ColumnParallelLinear(
+        self.linear_out = RowParallelLinear(
             inner_dim,
             dim_out,
             bias=bias,
-            gather_output=True,
+            input_is_parallel=True,
             quant_config=quant_config,
             prefix=f"{prefix}.linear_out" if prefix else "linear_out",
         )
@@ -150,6 +155,9 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
         self.query_dim = query_dim
         self.out_dim = out_dim if out_dim is not None else query_dim
         self.heads = out_dim // dim_head if out_dim is not None else num_heads
+        self.tp_size = get_tp_world_size()
+        self.local_heads = divide(self.heads, self.tp_size)
+        self.local_inner_dim = divide(self.inner_dim, self.tp_size)
 
         self.use_bias = bias
         self.dropout = dropout
@@ -163,11 +171,11 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
         self.use_fused_added_qkv = self.use_fused_qkv
 
         if self.use_fused_qkv:
-            self.to_qkv = ColumnParallelLinear(
+            self.to_qkv = MergedColumnParallelLinear(
                 query_dim,
-                self.inner_dim * 3,
+                [self.inner_dim] * 3,
                 bias=bias,
-                gather_output=True,
+                gather_output=False,
                 quant_config=quant_config,
                 prefix=f"{prefix}.to_qkv" if prefix else "to_qkv",
             )
@@ -176,7 +184,7 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
                 query_dim,
                 self.inner_dim,
                 bias=bias,
-                gather_output=True,
+                gather_output=False,
                 quant_config=quant_config,
                 prefix=f"{prefix}.to_q" if prefix else "to_q",
             )
@@ -184,7 +192,7 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
                 query_dim,
                 self.inner_dim,
                 bias=bias,
-                gather_output=True,
+                gather_output=False,
                 quant_config=quant_config,
                 prefix=f"{prefix}.to_k" if prefix else "to_k",
             )
@@ -192,7 +200,7 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
                 query_dim,
                 self.inner_dim,
                 bias=bias,
-                gather_output=True,
+                gather_output=False,
                 quant_config=quant_config,
                 prefix=f"{prefix}.to_v" if prefix else "to_v",
             )
@@ -203,11 +211,11 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
 
         self.to_out = torch.nn.ModuleList([])
         self.to_out.append(
-            ColumnParallelLinear(
+            RowParallelLinear(
                 self.inner_dim,
                 self.out_dim,
                 bias=out_bias,
-                gather_output=True,
+                input_is_parallel=True,
                 quant_config=quant_config,
                 prefix=f"{prefix}.to_out.0" if prefix else "to_out.0",
             )
@@ -219,11 +227,11 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
             self.norm_added_k = RMSNorm(dim_head, eps=eps)
             if self.use_fused_added_qkv:
                 # txt_attn.qkv is always BF16 in the NVFP4 checkpoint — no quant needed
-                self.to_added_qkv = ColumnParallelLinear(
+                self.to_added_qkv = MergedColumnParallelLinear(
                     added_kv_proj_dim,
-                    self.inner_dim * 3,
+                    [self.inner_dim] * 3,
                     bias=added_proj_bias,
-                    gather_output=True,
+                    gather_output=False,
                     quant_config=None,
                     prefix=f"{prefix}.to_added_qkv" if prefix else "to_added_qkv",
                 )
@@ -232,7 +240,7 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
                     added_kv_proj_dim,
                     self.inner_dim,
                     bias=added_proj_bias,
-                    gather_output=True,
+                    gather_output=False,
                     quant_config=quant_config,
                     prefix=f"{prefix}.add_q_proj" if prefix else "add_q_proj",
                 )
@@ -240,7 +248,7 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
                     added_kv_proj_dim,
                     self.inner_dim,
                     bias=added_proj_bias,
-                    gather_output=True,
+                    gather_output=False,
                     quant_config=quant_config,
                     prefix=f"{prefix}.add_k_proj" if prefix else "add_k_proj",
                 )
@@ -248,21 +256,21 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
                     added_kv_proj_dim,
                     self.inner_dim,
                     bias=added_proj_bias,
-                    gather_output=True,
+                    gather_output=False,
                     quant_config=quant_config,
                     prefix=f"{prefix}.add_v_proj" if prefix else "add_v_proj",
                 )
-            self.to_add_out = ColumnParallelLinear(
+            self.to_add_out = RowParallelLinear(
                 self.inner_dim,
                 query_dim,
                 bias=out_bias,
-                gather_output=True,
+                input_is_parallel=True,
                 quant_config=quant_config,
                 prefix=f"{prefix}.to_add_out" if prefix else "to_add_out",
             )
 
         self.attn = USPAttention(
-            num_heads=num_heads,
+            num_heads=self.local_heads,
             head_size=self.head_dim,
             dropout_rate=0,
             softmax_scale=None,
@@ -279,9 +287,9 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
             _get_qkv_projections(self, hidden_states, encoder_hidden_states)
         )
 
-        query = query.unflatten(-1, (self.heads, -1))
-        key = key.unflatten(-1, (self.heads, -1))
-        value = value.unflatten(-1, (self.heads, -1))
+        query = query.unflatten(-1, (self.local_heads, -1))
+        key = key.unflatten(-1, (self.local_heads, -1))
+        value = value.unflatten(-1, (self.local_heads, -1))
 
         query, key = apply_qk_norm(
             q=query,
@@ -293,9 +301,9 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
         )
 
         if self.added_kv_proj_dim is not None:
-            encoder_query = encoder_query.unflatten(-1, (self.heads, -1))
-            encoder_key = encoder_key.unflatten(-1, (self.heads, -1))
-            encoder_value = encoder_value.unflatten(-1, (self.heads, -1))
+            encoder_query = encoder_query.unflatten(-1, (self.local_heads, -1))
+            encoder_key = encoder_key.unflatten(-1, (self.local_heads, -1))
+            encoder_value = encoder_value.unflatten(-1, (self.local_heads, -1))
 
             encoder_query, encoder_key = apply_qk_norm(
                 q=encoder_query,
@@ -385,20 +393,25 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
         self.query_dim = query_dim
         self.out_dim = out_dim if out_dim is not None else query_dim
         self.heads = out_dim // dim_head if out_dim is not None else num_heads
+        self.tp_size = get_tp_world_size()
+        self.local_heads = divide(self.heads, self.tp_size)
+        self.local_inner_dim = divide(self.inner_dim, self.tp_size)
 
         self.use_bias = bias
         self.dropout = dropout
 
         self.mlp_ratio = mlp_ratio
         self.mlp_hidden_dim = int(query_dim * self.mlp_ratio)
+        self.local_mlp_hidden_dim = divide(self.mlp_hidden_dim, self.tp_size)
         self.mlp_mult_factor = mlp_mult_factor
 
         # Fused QKV projections + MLP input projection
-        self.to_qkv_mlp_proj = ColumnParallelLinear(
+        self.to_qkv_mlp_proj = MergedColumnParallelLinear(
             self.query_dim,
-            self.inner_dim * 3 + self.mlp_hidden_dim * self.mlp_mult_factor,
+            [self.inner_dim, self.inner_dim, self.inner_dim]
+            + [self.mlp_hidden_dim] * self.mlp_mult_factor,
             bias=bias,
-            gather_output=True,
+            gather_output=False,
             quant_config=quant_config,
             prefix=f"{prefix}.to_qkv_mlp_proj" if prefix else "to_qkv_mlp_proj",
         )
@@ -409,17 +422,17 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
         self.norm_k = RMSNorm(dim_head, eps=eps)
 
         # Fused attention output projection + MLP output projection
-        self.to_out = ColumnParallelLinear(
+        self.to_out = RowParallelLinear(
             self.inner_dim + self.mlp_hidden_dim,
             self.out_dim,
             bias=out_bias,
-            gather_output=True,
+            input_is_parallel=True,
             quant_config=quant_config,
             prefix=f"{prefix}.to_out" if prefix else "to_out",
         )
 
         self.attn = USPAttention(
-            num_heads=num_heads,
+            num_heads=self.local_heads,
             head_size=self.head_dim,
             dropout_rate=0,
             softmax_scale=None,
@@ -438,16 +451,19 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
         hidden_states, _ = self.to_qkv_mlp_proj(hidden_states)
         qkv, mlp_hidden_states = torch.split(
             hidden_states,
-            [3 * self.inner_dim, self.mlp_hidden_dim * self.mlp_mult_factor],
+            [
+                3 * self.local_inner_dim,
+                self.local_mlp_hidden_dim * self.mlp_mult_factor,
+            ],
             dim=-1,
         )
 
         # Handle the attention logic
         query, key, value = qkv.chunk(3, dim=-1)
 
-        query = query.unflatten(-1, (self.heads, -1))
-        key = key.unflatten(-1, (self.heads, -1))
-        value = value.unflatten(-1, (self.heads, -1))
+        query = query.unflatten(-1, (self.local_heads, -1))
+        key = key.unflatten(-1, (self.local_heads, -1))
+        value = value.unflatten(-1, (self.local_heads, -1))
 
         query = self.norm_q(query)
         key = self.norm_k(key)

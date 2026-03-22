@@ -224,10 +224,18 @@ class ModelOptFp4Config(ModelOptQuantConfig):
         return False
 
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
-        if current_platform.should_use_modelopt_fp4_best_performance_kit():
+        should_use_best_perf_kit = getattr(
+            current_platform, "should_use_modelopt_fp4_best_performance_kit", None
+        )
+        warn_missing_best_perf_kit = getattr(
+            current_platform, "warn_if_modelopt_fp4_best_performance_kit_missing", None
+        )
+
+        if callable(should_use_best_perf_kit) and should_use_best_perf_kit():
             linear_cls = ComfyUIFp4LinearMethod
         else:
-            current_platform.warn_if_modelopt_fp4_best_performance_kit_missing()
+            if callable(warn_missing_best_perf_kit):
+                warn_missing_best_perf_kit()
             linear_cls = ModelOptFp4LinearMethod
         return self._get_quant_method(layer, prefix, Linear=linear_cls)
 

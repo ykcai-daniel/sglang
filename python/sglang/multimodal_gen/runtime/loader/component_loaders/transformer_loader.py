@@ -26,7 +26,7 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import get_log_level, init_logger
 from sglang.multimodal_gen.runtime.utils.quantization_utils import (
-    build_nvfp4_config_from_safetensors,
+    build_nvfp4_config_from_safetensors_list,
     get_metadata_from_safetensors_file,
     get_quant_config,
     get_quant_config_from_safetensors_metadata,
@@ -100,12 +100,11 @@ class TransformerLoader(ComponentLoader):
             param_names_mapping_dict = (
                 server_args.pipeline_config.dit_config.arch_config.param_names_mapping
             )
-            for safetensors_file in safetensors_list:
-                quant_config = build_nvfp4_config_from_safetensors(
-                    safetensors_file, param_names_mapping_dict
-                )
-                if quant_config:
-                    return quant_config
+            quant_config = build_nvfp4_config_from_safetensors_list(
+                safetensors_list, param_names_mapping_dict
+            )
+            if quant_config:
+                return quant_config
         return quant_config
 
     def _resolve_target_param_dtype(

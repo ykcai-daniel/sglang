@@ -106,13 +106,12 @@ class CudaPlatformBase(Platform):
     @classmethod
     @lru_cache(maxsize=1)
     def get_modelopt_fp4_quantize_op(cls) -> Callable | None:
-        if cls.is_sm120() or cls.is_blackwell():
-            try:
-                from flashinfer import fp4_quantize
+        try:
+            from flashinfer import fp4_quantize
 
-                return fp4_quantize
-            except ImportError:
-                return None
+            return fp4_quantize
+        except ImportError:
+            pass
 
         try:
             from sgl_kernel import scaled_fp4_quant as fp4_quantize
@@ -124,18 +123,27 @@ class CudaPlatformBase(Platform):
     @classmethod
     @lru_cache(maxsize=1)
     def get_modelopt_fp4_gemm_op(cls) -> tuple[Callable | None, str | None]:
+        if cls.is_blackwell():
+            try:
+                from flashinfer import mm_fp4 as flashinfer_mm_fp4
+
+                return flashinfer_mm_fp4, "cudnn"
+            except ImportError:
+                pass
+
+        try:
+            from sgl_kernel import cutlass_scaled_fp4_mm as cutlass_fp4_gemm
+
+            return cutlass_fp4_gemm, None
+        except ImportError:
+            pass
+
         try:
             from flashinfer import mm_fp4 as flashinfer_mm_fp4
 
-            backend = "cudnn" if cls.is_blackwell() else "auto"
-            return flashinfer_mm_fp4, backend
+            return flashinfer_mm_fp4, "auto"
         except ImportError:
-            try:
-                from sgl_kernel import cutlass_scaled_fp4_mm as cutlass_fp4_gemm
-
-                return cutlass_fp4_gemm, None
-            except ImportError:
-                return None, None
+            return None, None
 
     @classmethod
     @lru_cache(maxsize=1)

@@ -404,6 +404,7 @@ def load_model_from_full_model_state_dict(
         "gate_compress",
         "wcscales",
         "wtscale",
+        "input_scale",
         "bias",
         "norm_q",
         "norm_k",
@@ -433,7 +434,8 @@ def load_model_from_full_model_state_dict(
             )
 
         if missing_param_init == "ones" or any(
-            p in new_param_name for p in ("wcscales", "wtscale", "norm_q", "norm_k")
+            p in new_param_name
+            for p in ("wcscales", "wtscale", "input_scale", "norm_q", "norm_k")
         ):
             init_like = torch.ones_like
         elif missing_param_init == "zeros" or missing_param_init is None:
