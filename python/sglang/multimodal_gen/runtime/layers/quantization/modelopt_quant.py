@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional
 
 import torch
 
+from sglang.multimodal_gen.runtime.distributed import get_tp_rank
 from sglang.multimodal_gen.runtime.layers.linear import (
     LinearMethodBase,
     UnquantizedLinearMethod,
@@ -246,6 +247,48 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
     def __init__(self, quant_config: ModelOptFp4Config):
         self.quant_config = quant_config
 
+    def _weight_scale_loader(
+        self, param: ModelWeightParameter, loaded_weight: torch.Tensor
+    ) -> None:
+        # NVFP4 block scales in the checkpoint are stored in blocked layout.
+        # For RowParallelLinear, slicing the blocked tensor directly along K
+        # produces the wrong local shard. Restore the linear scale matrix first,
+        # slice the local K range, then pack it back to blocked layout.
+        if len(loaded_weight.shape) == 0:
+            loaded_weight = loaded_weight.reshape(1)
+
+        input_dim = getattr(param, "input_dim", None)
+        if (
+            input_dim is None
+            or param.data.ndim != 2
+            or loaded_weight.ndim != 2
+            or param.data.shape == loaded_weight.shape
+        ):
+            param.load_row_parallel_weight(loaded_weight)
+            return
+
+        try:
+            from comfy_kitchen.float_utils import from_blocked, to_blocked
+        except ImportError:
+            logger.warning(
+                "comfy_kitchen.float_utils is unavailable; falling back to the "
+                "generic row-parallel weight_scale loader."
+            )
+            param.load_row_parallel_weight(loaded_weight)
+            return
+
+        scale_rows, scale_cols = loaded_weight.shape
+        scales_rm = from_blocked(
+            loaded_weight, num_rows=scale_rows, num_cols=scale_cols
+        )
+        shard_size = param.data.shape[input_dim]
+        start_idx = get_tp_rank() * shard_size
+        scales_rm = scales_rm.narrow(input_dim, start_idx, shard_size).contiguous()
+        blocked_shard = to_blocked(scales_rm, flatten=False)
+
+        assert param.data.shape == blocked_shard.shape
+        param.data.copy_(blocked_shard)
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -306,6 +349,13 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         )
         layer.register_parameter("weight_scale_2", weight_scale_2)
 
+        try:
+            from sglang.multimodal_gen.runtime.layers.linear import RowParallelLinear
+
+            is_row_parallel = isinstance(layer, RowParallelLinear) and layer.tp_size > 1
+        except ImportError:
+            is_row_parallel = False
+
         weight_scale = ModelWeightParameter(
             data=torch.empty(
                 output_size_per_partition,
@@ -314,7 +364,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
             ),
             input_dim=1,
             output_dim=0,
-            weight_loader=weight_loader,
+            weight_loader=self._weight_scale_loader if is_row_parallel else weight_loader,
         )
 
         layer.register_parameter("weight_scale", weight_scale)
@@ -344,6 +394,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         if scale_ndim == 2:
             scales = scales.unsqueeze(0)
         assert scales.ndim == 3
+
         B, M, K = scales.shape
         M_padded = round_up(M, 128)
         K_padded = round_up(K, 4)

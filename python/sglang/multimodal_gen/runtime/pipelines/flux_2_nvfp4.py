@@ -6,6 +6,7 @@ from functools import lru_cache
 from typing import Any, cast
 
 from sglang.multimodal_gen.runtime.pipelines.flux_2 import Flux2Pipeline
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     maybe_download_model,
@@ -75,15 +76,30 @@ class Flux2NvfpPipeline(Flux2Pipeline):
     ) -> dict:
         if server_args.transformer_weights_path is None:
             local_nvfp4_path = maybe_download_model(self.model_path)
+            use_best_perf_kit = getattr(
+                current_platform,
+                "should_use_modelopt_fp4_best_performance_kit",
+                None,
+            )
+            generic_modelopt_fallback = not (
+                callable(use_best_perf_kit) and use_best_perf_kit()
+            )
             mixed_file = _find_mixed_safetensors(local_nvfp4_path)
-            if mixed_file:
+            if mixed_file and not generic_modelopt_fallback:
                 logger.info("Using mixed-precision NVFP4 weights: %s", mixed_file)
                 server_args.transformer_weights_path = mixed_file
             else:
-                logger.warning(
-                    "No *-mixed.safetensors found in %s; falling back to full directory",
-                    local_nvfp4_path,
-                )
+                if mixed_file and generic_modelopt_fallback:
+                    logger.warning(
+                        "best performance NVFP4 kit is unavailable; generic ModelOpt fallback "
+                        "uses the full NVFP4 directory because the mixed safetensors omits "
+                        "some quantization tensors needed by fallback layers."
+                    )
+                else:
+                    logger.warning(
+                        "No *-mixed.safetensors found in %s; falling back to full directory",
+                        local_nvfp4_path,
+                    )
                 server_args.transformer_weights_path = local_nvfp4_path
 
         logger.info(

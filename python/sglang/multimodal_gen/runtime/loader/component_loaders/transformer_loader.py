@@ -19,6 +19,7 @@ from sglang.multimodal_gen.runtime.loader.utils import (
     _normalize_component_type,
 )
 from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     get_diffusers_component_config,
@@ -45,6 +46,37 @@ class TransformerLoader(ComponentLoader):
 
     component_names = ["transformer", "audio_dit", "video_dit"]
     expected_library = "diffusers"
+
+    def _maybe_adjust_attention_backend_for_flux2_nvfp4_fallback(
+        self,
+        cls_name: str,
+        server_args: ServerArgs,
+        quant_config: Optional[QuantizationConfig],
+    ) -> None:
+        if server_args.attention_backend is not None:
+            return
+        if cls_name != "Flux2Transformer2DModel" or quant_config is None:
+            return
+
+        quant_name_getter = getattr(type(quant_config), "get_name", None)
+        quant_name = quant_name_getter() if callable(quant_name_getter) else None
+        if quant_name != "modelopt_fp4":
+            return
+
+        use_best_perf_kit = getattr(
+            current_platform,
+            "should_use_modelopt_fp4_best_performance_kit",
+            None,
+        )
+        if callable(use_best_perf_kit) and use_best_perf_kit():
+            return
+
+        server_args.attention_backend = "torch_sdpa"
+        logger.warning(
+            "FLUX.2 NVFP4 is using the generic ModelOpt FP4 fallback; "
+            "defaulting attention_backend to torch_sdpa to avoid FA4 launch failures. "
+            "Override with --attention-backend if you need a different backend."
+        )
 
     def get_list_of_safetensors_to_load(
         self, server_args: ServerArgs, component_model_path: str
@@ -180,6 +212,10 @@ class TransformerLoader(ComponentLoader):
             len(safetensors_list),
             f": {safetensors_list}" if get_log_level() == logging.DEBUG else "",
             param_dtype,
+        )
+
+        self._maybe_adjust_attention_backend_for_flux2_nvfp4_fallback(
+            cls_name, server_args, quant_config
         )
 
         # prepare init_param
