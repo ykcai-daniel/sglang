@@ -123,25 +123,7 @@ class CudaPlatformBase(Platform):
     @classmethod
     @lru_cache(maxsize=1)
     def get_modelopt_fp4_gemm_op(cls) -> tuple[Callable | None, str | None]:
-        backend_override = os.environ.get("SGLANG_NVFP4_GEMM_BACKEND")
-        if backend_override is not None:
-            backend_override = backend_override.strip().lower()
-
-        prefer_sgl_kernel = backend_override == "sgl_kernel"
-        prefer_flashinfer = backend_override == "flashinfer"
-
-        if prefer_sgl_kernel:
-            try:
-                from sgl_kernel import cutlass_scaled_fp4_mm as cutlass_fp4_gemm
-
-                return cutlass_fp4_gemm, None
-            except ImportError:
-                logger.warning(
-                    "SGLANG_NVFP4_GEMM_BACKEND=sgl_kernel was requested, but "
-                    "sgl_kernel FP4 GEMM is unavailable; falling back to default order."
-                )
-
-        if cls.is_blackwell() and not prefer_sgl_kernel:
+        if cls.is_blackwell():
             try:
                 from flashinfer import mm_fp4 as flashinfer_mm_fp4
 
@@ -156,21 +138,12 @@ class CudaPlatformBase(Platform):
         except ImportError:
             pass
 
-        if not prefer_sgl_kernel:
-            try:
-                from flashinfer import mm_fp4 as flashinfer_mm_fp4
+        try:
+            from flashinfer import mm_fp4 as flashinfer_mm_fp4
 
-                return flashinfer_mm_fp4, "auto"
-            except ImportError:
-                pass
-
-        if prefer_flashinfer:
-            logger.warning(
-                "SGLANG_NVFP4_GEMM_BACKEND=flashinfer was requested, but "
-                "flashinfer FP4 GEMM is unavailable."
-            )
-
-        return None, None
+            return flashinfer_mm_fp4, "auto"
+        except ImportError:
+            return None, None
 
     @classmethod
     @lru_cache(maxsize=1)
