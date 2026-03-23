@@ -62,6 +62,41 @@ WEIGHT_LOADER_V2_SUPPORTED = [
 ]
 
 
+def shard_tensor_by_logical_widths_for_tp(
+    tensor: torch.Tensor,
+    logical_widths: list[int] | tuple[int, ...] | None,
+    dim: int,
+    tp_rank: int,
+    tp_size: int,
+) -> torch.Tensor | None:
+    if not logical_widths or tensor.ndim == 0 or dim < 0 or dim >= tensor.ndim:
+        return None
+
+    total_width = tensor.shape[dim]
+    candidate_widths: list[int] | None = None
+    if sum(logical_widths) == total_width:
+        candidate_widths = list(logical_widths)
+    elif all(width % 2 == 0 for width in logical_widths) and sum(
+        width // 2 for width in logical_widths
+    ) == total_width:
+        candidate_widths = [width // 2 for width in logical_widths]
+
+    if candidate_widths is None:
+        return None
+
+    shards = []
+    offset = 0
+    for width in candidate_widths:
+        if width % tp_size != 0:
+            return None
+        shard_size = width // tp_size
+        shard_offset = offset + tp_rank * shard_size
+        shards.append(tensor.narrow(dim, shard_offset, shard_size))
+        offset += width
+
+    return torch.cat(shards, dim=dim).contiguous()
+
+
 def adjust_scalar_to_fused_array(
     param: torch.Tensor, loaded_weight: torch.Tensor, shard_id: str | int
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1028,6 +1063,17 @@ class RowParallelLinear(LinearBase):
         param_data.copy_(loaded_weight)
 
     def weight_loader_v2(self, param: BasevLLMParameter, loaded_weight: torch.Tensor):
+        sharded = shard_tensor_by_logical_widths_for_tp(
+            loaded_weight,
+            getattr(self, "input_logical_widths", None),
+            getattr(param, "input_dim", -1),
+            self.tp_rank,
+            self.tp_size,
+        )
+        if sharded is not None:
+            assert param.data.shape == sharded.shape
+            param.data.copy_(sharded)
+            return
 
         # Special case for loading scales off disk, which often do not
         # have a shape (such as in the case of AutoFP8).

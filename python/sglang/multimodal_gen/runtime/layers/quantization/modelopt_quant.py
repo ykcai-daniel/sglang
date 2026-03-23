@@ -7,10 +7,11 @@ from typing import Any, Dict, List, Optional
 
 import torch
 
-from sglang.multimodal_gen.runtime.distributed import get_tp_rank
+from sglang.multimodal_gen.runtime.distributed import get_tp_rank, get_tp_world_size
 from sglang.multimodal_gen.runtime.layers.linear import (
     LinearMethodBase,
     UnquantizedLinearMethod,
+    shard_tensor_by_logical_widths_for_tp,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
@@ -281,9 +282,23 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         scales_rm = from_blocked(
             loaded_weight, num_rows=scale_rows, num_cols=scale_cols
         )
-        shard_size = param.data.shape[input_dim]
-        start_idx = get_tp_rank() * shard_size
-        scales_rm = scales_rm.narrow(input_dim, start_idx, shard_size).contiguous()
+        logical_widths = getattr(param, "input_logical_widths", None)
+        if logical_widths is not None:
+            logical_widths = [
+                width // self.quant_config.group_size for width in logical_widths
+            ]
+        sharded = shard_tensor_by_logical_widths_for_tp(
+            scales_rm,
+            logical_widths,
+            input_dim,
+            get_tp_rank(),
+            get_tp_world_size(),
+        )
+        if sharded is None:
+            shard_size = param.data.shape[input_dim]
+            start_idx = get_tp_rank() * shard_size
+            sharded = scales_rm.narrow(input_dim, start_idx, shard_size).contiguous()
+        scales_rm = sharded
         blocked_shard = to_blocked(scales_rm, flatten=False)
 
         assert param.data.shape == blocked_shard.shape
