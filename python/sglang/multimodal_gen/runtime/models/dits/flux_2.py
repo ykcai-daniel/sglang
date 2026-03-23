@@ -808,6 +808,9 @@ class Flux2Transformer2DModel(CachableDiT, OffloadableDiTMixin):
     scale_shift_swap_params = ("norm_out.linear.weight", "norm_out.linear.bias")
 
     def post_load_weights(self) -> None:
+        if not isinstance(getattr(self, "quant_config", None), ModelOptFp4Config):
+            return
+
         # BFL/ComfyUI checkpoints store AdaLN modulation params as [scale, shift],
         # while diffusers expects [shift, scale].
         for param_name in self.scale_shift_swap_params:
@@ -852,6 +855,7 @@ class Flux2Transformer2DModel(CachableDiT, OffloadableDiTMixin):
         self.inner_dim = num_attention_heads * attention_head_dim
         self.guidance_embeds = guidance_embeds
         quant_config = quant_config if quant_config is not None else config.quant_config
+        self.quant_config = quant_config
 
         # 1. Sinusoidal positional embedding for RoPE on image and text tokens
         self.rotary_emb = Flux2PosEmbed(theta=rope_theta, axes_dim=axes_dims_rope)
