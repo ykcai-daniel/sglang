@@ -47,12 +47,14 @@ class TransformerLoader(ComponentLoader):
     component_names = ["transformer", "audio_dit", "video_dit"]
     expected_library = "diffusers"
 
-    def _maybe_adjust_flux2_nvfp4_fallback_defaults(
+    def _maybe_adjust_attention_backend_for_flux2_nvfp4_fallback(
         self,
         cls_name: str,
         server_args: ServerArgs,
         quant_config: Optional[QuantizationConfig],
     ) -> None:
+        if server_args.attention_backend is not None:
+            return
         if cls_name != "Flux2Transformer2DModel" or quant_config is None:
             return
 
@@ -69,19 +71,12 @@ class TransformerLoader(ComponentLoader):
         if callable(use_best_perf_kit) and use_best_perf_kit():
             return
 
-        weights_path = os.path.basename(server_args.transformer_weights_path or "")
-        if not weights_path.endswith("-mixed.safetensors") or server_args.tp_size <= 1:
-            return
-
-        if server_args.dit_cpu_offload or server_args.text_encoder_cpu_offload:
-            server_args.dit_cpu_offload = False
-            server_args.text_encoder_cpu_offload = False
-            logger.warning(
-                "FLUX.2 mixed NVFP4 is using the generic ModelOpt FP4 fallback with tp_size=%d; "
-                "disabling dit/text-encoder CPU offload to avoid TP all-gather launch failures. "
-                "Override the offload flags explicitly if you need the old behavior.",
-                server_args.tp_size,
-            )
+        server_args.attention_backend = "torch_sdpa"
+        logger.warning(
+            "FLUX.2 NVFP4 is using the generic ModelOpt FP4 fallback; "
+            "defaulting attention_backend to torch_sdpa to avoid FA4 launch failures. "
+            "Override with --attention-backend if you need a different backend."
+        )
 
     def get_list_of_safetensors_to_load(
         self, server_args: ServerArgs, component_model_path: str
@@ -219,7 +214,7 @@ class TransformerLoader(ComponentLoader):
             param_dtype,
         )
 
-        self._maybe_adjust_flux2_nvfp4_fallback_defaults(
+        self._maybe_adjust_attention_backend_for_flux2_nvfp4_fallback(
             cls_name, server_args, quant_config
         )
 
