@@ -40,7 +40,6 @@ from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     apply_flashinfer_rope_qk_inplace,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
-from sglang.multimodal_gen.runtime.models.utils import set_weight_attrs
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -431,12 +430,6 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
             quant_config=quant_config,
             prefix=f"{prefix}.to_out" if prefix else "to_out",
         )
-        self.to_out.input_logical_widths = [self.inner_dim, self.mlp_hidden_dim]
-        if hasattr(self.to_out, "weight_scale"):
-            set_weight_attrs(
-                self.to_out.weight_scale,
-                {"input_logical_widths": [self.inner_dim, self.mlp_hidden_dim]},
-            )
 
         self.attn = USPAttention(
             num_heads=self.local_heads,
