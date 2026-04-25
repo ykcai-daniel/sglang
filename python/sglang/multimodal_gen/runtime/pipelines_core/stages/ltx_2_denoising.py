@@ -7,11 +7,14 @@ from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     is_ltx23_native_variant,
 )
 from sglang.multimodal_gen.runtime.distributed import get_sp_world_size
+from sglang.multimodal_gen.runtime.distributed.cfg_parallel_utils import dispatch_branches
 from sglang.multimodal_gen.runtime.distributed.communication_op import (
+    cfg_model_parallel_all_gather,
     cfg_model_parallel_all_reduce,
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_classifier_free_guidance_rank,
+    get_classifier_free_guidance_world_size,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
@@ -137,6 +140,124 @@ class LTX2DenoisingStage(DenoisingStage):
             cfg_model_parallel_all_reduce(video_partial),
             cfg_model_parallel_all_reduce(audio_partial),
         )
+
+    def _run_legacy_one_stage_multi_branch_cfg_parallel(
+        self,
+        *,
+        base_model_kwargs: dict[str, object],
+        ctx: "LTX2DenoisingContext",
+        step: "DenoisingStepState",
+        encoder_hidden_states: torch.Tensor,
+        audio_encoder_hidden_states: torch.Tensor,
+        encoder_attention_mask: torch.Tensor | None,
+        negative_encoder_hidden_states: torch.Tensor,
+        negative_audio_encoder_hidden_states: torch.Tensor,
+        negative_encoder_attention_mask: torch.Tensor | None,
+        need_perturbed: bool,
+        need_modality: bool,
+        stage1_guider_params: dict[str, object],
+    ) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
+        """Multi-branch CFG parallel for the legacy LTX-2.3 one-stage path.
+
+        Distributes up to 4 forward passes (cond, neg, perturbed, modality)
+        across CFG ranks via round-robin.  Each rank runs only its assigned
+        passes, then an all-gather collects every output so all ranks can
+        compute the guidance combination locally.
+        """
+        cfg_rank = get_classifier_free_guidance_rank()
+        cfg_world_size = get_classifier_free_guidance_world_size()
+
+        # Build kwargs for every pass in canonical order.
+        all_passes: list[tuple[str, dict[str, object]]] = [
+            (
+                "cond",
+                self._build_ltx2_model_kwargs(
+                    ctx,
+                    base_model_kwargs,
+                    encoder_hidden_states=encoder_hidden_states,
+                    audio_encoder_hidden_states=audio_encoder_hidden_states,
+                    encoder_attention_mask=encoder_attention_mask,
+                ),
+            ),
+            (
+                "neg",
+                self._build_ltx2_model_kwargs(
+                    ctx,
+                    base_model_kwargs,
+                    encoder_hidden_states=negative_encoder_hidden_states,
+                    audio_encoder_hidden_states=negative_audio_encoder_hidden_states,
+                    encoder_attention_mask=negative_encoder_attention_mask,
+                ),
+            ),
+        ]
+        if need_perturbed:
+            all_passes.append((
+                "perturbed",
+                self._build_ltx2_model_kwargs(
+                    ctx,
+                    base_model_kwargs,
+                    encoder_hidden_states=encoder_hidden_states,
+                    audio_encoder_hidden_states=audio_encoder_hidden_states,
+                    encoder_attention_mask=encoder_attention_mask,
+                    skip_video_self_attn_blocks=tuple(stage1_guider_params["video_stg_blocks"]),
+                    skip_audio_self_attn_blocks=tuple(stage1_guider_params["audio_stg_blocks"]),
+                ),
+            ))
+        if need_modality:
+            all_passes.append((
+                "modality",
+                self._build_ltx2_model_kwargs(
+                    ctx,
+                    base_model_kwargs,
+                    encoder_hidden_states=encoder_hidden_states,
+                    audio_encoder_hidden_states=audio_encoder_hidden_states,
+                    encoder_attention_mask=encoder_attention_mask,
+                    disable_a2v_cross_attn=True,
+                    disable_v2a_cross_attn=True,
+                ),
+            ))
+
+        pass_names = [name for name, _ in all_passes]
+        n_passes = len(pass_names)
+        assignments = dispatch_branches(n_passes, cfg_world_size)
+        my_indices = assignments[cfg_rank]
+        max_local = max(len(a) for a in assignments)
+
+        local_videos: list[torch.Tensor] = []
+        local_audios: list[torch.Tensor] = []
+
+        with set_forward_context(current_timestep=step.step_index, attn_metadata=step.attn_metadata):
+            for idx in my_indices:
+                _, kwargs = all_passes[idx]
+                v, a = step.current_model(**kwargs)
+                local_videos.append(v.float())
+                local_audios.append(a.float())
+
+        # Pad to max_local for unbalanced cases (n_passes not divisible by n_ranks).
+        while len(local_videos) < max_local:
+            local_videos.append(torch.zeros_like(local_videos[0]))
+            local_audios.append(torch.zeros_like(local_audios[0]))
+
+        # Stack → [max_local, B, ...], flatten to [max_local*B, ...] for all-gather.
+        local_v = torch.stack(local_videos, dim=0)
+        local_a = torch.stack(local_audios, dim=0)
+        B = local_v.shape[1]
+        local_v_flat = local_v.reshape(max_local * B, *local_v.shape[2:])
+        local_a_flat = local_a.reshape(max_local * B, *local_a.shape[2:])
+
+        # All-gather along batch dim → [cfg_world_size * max_local * B, ...].
+        all_v_flat = cfg_model_parallel_all_gather(local_v_flat, dim=0)
+        all_a_flat = cfg_model_parallel_all_gather(local_a_flat, dim=0)
+
+        # Reshape to [cfg_world_size, max_local, B, ...].
+        all_v = all_v_flat.reshape(cfg_world_size, max_local, B, *all_v_flat.shape[1:])
+        all_a = all_a_flat.reshape(cfg_world_size, max_local, B, *all_a_flat.shape[1:])
+
+        # Branch i was run by rank (i % cfg_world_size) at slot (i // cfg_world_size).
+        return {
+            name: (all_v[i % cfg_world_size, i // cfg_world_size], all_a[i % cfg_world_size, i // cfg_world_size])
+            for i, name in enumerate(pass_names)
+        }
 
     @staticmethod
     def _get_video_latent_num_frames_for_model(
@@ -785,46 +906,63 @@ class LTX2DenoisingStage(DenoisingStage):
         )
         use_official_cfg_path = stage1_guider_params is None
         if use_official_cfg_path:
-            model_kwargs = self._build_ltx2_model_kwargs(
-                ctx,
-                base_model_kwargs,
-                encoder_hidden_states=batch.prompt_embeds[0],
-                audio_encoder_hidden_states=batch.audio_prompt_embeds[0],
-                encoder_attention_mask=prompt_attention_mask,
-            )
-            if batch.do_classifier_free_guidance:
-                cfg_batch_size = batch_size * 2
-                model_kwargs = self._repeat_ltx2_model_kwargs_batch(
-                    model_kwargs, cfg_batch_size
+            cfg_parallel = server_args.enable_cfg_parallel and batch.do_classifier_free_guidance
+            cfg_rank = get_classifier_free_guidance_rank() if cfg_parallel else 0
+
+            if cfg_parallel:
+                neg_attn_mask = self._get_ltx_prompt_attention_mask(
+                    batch,
+                    is_ltx23_variant=(ctx.is_ltx23_variant and not ctx.use_ltx23_legacy_one_stage),
+                    negative=True,
                 )
-                model_kwargs["encoder_hidden_states"] = torch.cat(
-                    [batch.negative_prompt_embeds[0], batch.prompt_embeds[0]], dim=0
+                model_kwargs = self._build_ltx2_model_kwargs(
+                    ctx,
+                    base_model_kwargs,
+                    encoder_hidden_states=batch.prompt_embeds[0] if cfg_rank == 0 else batch.negative_prompt_embeds[0],
+                    audio_encoder_hidden_states=batch.audio_prompt_embeds[0] if cfg_rank == 0 else batch.negative_audio_prompt_embeds[0],
+                    encoder_attention_mask=prompt_attention_mask if cfg_rank == 0 else neg_attn_mask,
                 )
-                model_kwargs["audio_encoder_hidden_states"] = torch.cat(
-                    [
-                        batch.negative_audio_prompt_embeds[0],
-                        batch.audio_prompt_embeds[0],
-                    ],
-                    dim=0,
+            else:
+                model_kwargs = self._build_ltx2_model_kwargs(
+                    ctx,
+                    base_model_kwargs,
+                    encoder_hidden_states=batch.prompt_embeds[0],
+                    audio_encoder_hidden_states=batch.audio_prompt_embeds[0],
+                    encoder_attention_mask=prompt_attention_mask,
                 )
-                if self._should_pass_ltx2_text_attention_mask(ctx):
-                    repeated_attention_mask = self._cat_or_none(
+                if batch.do_classifier_free_guidance:
+                    cfg_batch_size = batch_size * 2
+                    model_kwargs = self._repeat_ltx2_model_kwargs_batch(
+                        model_kwargs, cfg_batch_size
+                    )
+                    model_kwargs["encoder_hidden_states"] = torch.cat(
+                        [batch.negative_prompt_embeds[0], batch.prompt_embeds[0]], dim=0
+                    )
+                    model_kwargs["audio_encoder_hidden_states"] = torch.cat(
                         [
-                            self._get_ltx_prompt_attention_mask(
-                                batch,
-                                is_ltx23_variant=(
-                                    ctx.is_ltx23_variant
-                                    and not ctx.use_ltx23_legacy_one_stage
+                            batch.negative_audio_prompt_embeds[0],
+                            batch.audio_prompt_embeds[0],
+                        ],
+                        dim=0,
+                    )
+                    if self._should_pass_ltx2_text_attention_mask(ctx):
+                        repeated_attention_mask = self._cat_or_none(
+                            [
+                                self._get_ltx_prompt_attention_mask(
+                                    batch,
+                                    is_ltx23_variant=(
+                                        ctx.is_ltx23_variant
+                                        and not ctx.use_ltx23_legacy_one_stage
+                                    ),
+                                    negative=True,
                                 ),
-                                negative=True,
-                            ),
-                            prompt_attention_mask,
-                        ]
-                    )
-                    model_kwargs["encoder_attention_mask"] = repeated_attention_mask
-                    model_kwargs["audio_encoder_attention_mask"] = (
-                        repeated_attention_mask
-                    )
+                                prompt_attention_mask,
+                            ]
+                        )
+                        model_kwargs["encoder_attention_mask"] = repeated_attention_mask
+                        model_kwargs["audio_encoder_attention_mask"] = (
+                            repeated_attention_mask
+                        )
 
             with set_forward_context(
                 current_timestep=step.step_index, attn_metadata=step.attn_metadata
@@ -892,76 +1030,96 @@ class LTX2DenoisingStage(DenoisingStage):
         )
 
         if ctx.use_ltx23_legacy_one_stage:
-            with set_forward_context(
-                current_timestep=step.step_index, attn_metadata=step.attn_metadata
-            ):
-                v_pos, a_v_pos = step.current_model(
-                    **self._build_ltx2_model_kwargs(
-                        ctx,
-                        base_model_kwargs,
-                        encoder_hidden_states=encoder_hidden_states,
-                        audio_encoder_hidden_states=audio_encoder_hidden_states,
-                        encoder_attention_mask=encoder_attention_mask,
-                    )
+            if server_args.enable_cfg_parallel:
+                pass_outputs = self._run_legacy_one_stage_multi_branch_cfg_parallel(
+                    base_model_kwargs=base_model_kwargs,
+                    ctx=ctx,
+                    step=step,
+                    encoder_hidden_states=encoder_hidden_states,
+                    audio_encoder_hidden_states=audio_encoder_hidden_states,
+                    encoder_attention_mask=encoder_attention_mask,
+                    negative_encoder_hidden_states=negative_encoder_hidden_states,
+                    negative_audio_encoder_hidden_states=negative_audio_encoder_hidden_states,
+                    negative_encoder_attention_mask=negative_encoder_attention_mask,
+                    need_perturbed=need_perturbed,
+                    need_modality=need_modality,
+                    stage1_guider_params=stage1_guider_params,
                 )
-                v_neg, a_v_neg = step.current_model(
-                    **self._build_ltx2_model_kwargs(
-                        ctx,
-                        base_model_kwargs,
-                        encoder_hidden_states=negative_encoder_hidden_states,
-                        audio_encoder_hidden_states=negative_audio_encoder_hidden_states,
-                        encoder_attention_mask=negative_encoder_attention_mask,
-                    )
-                )
-
-            v_pos = v_pos.float()
-            a_v_pos = a_v_pos.float()
-            v_neg = v_neg.float()
-            a_v_neg = a_v_neg.float()
-
-            v_ptb = None
-            a_v_ptb = None
-            if need_perturbed:
+                v_pos, a_v_pos = pass_outputs["cond"]
+                v_neg, a_v_neg = pass_outputs["neg"]
+                v_ptb, a_v_ptb = pass_outputs.get("perturbed", (None, None))
+                v_mod, a_v_mod = pass_outputs.get("modality", (None, None))
+            else:
                 with set_forward_context(
                     current_timestep=step.step_index, attn_metadata=step.attn_metadata
                 ):
-                    v_ptb, a_v_ptb = step.current_model(
+                    v_pos, a_v_pos = step.current_model(
                         **self._build_ltx2_model_kwargs(
                             ctx,
                             base_model_kwargs,
                             encoder_hidden_states=encoder_hidden_states,
                             audio_encoder_hidden_states=audio_encoder_hidden_states,
                             encoder_attention_mask=encoder_attention_mask,
-                            skip_video_self_attn_blocks=tuple(
-                                stage1_guider_params["video_stg_blocks"]
-                            ),
-                            skip_audio_self_attn_blocks=tuple(
-                                stage1_guider_params["audio_stg_blocks"]
-                            ),
                         )
                     )
-                v_ptb = v_ptb.float()
-                a_v_ptb = a_v_ptb.float()
-
-            v_mod = None
-            a_v_mod = None
-            if need_modality:
-                with set_forward_context(
-                    current_timestep=step.step_index, attn_metadata=step.attn_metadata
-                ):
-                    v_mod, a_v_mod = step.current_model(
+                    v_neg, a_v_neg = step.current_model(
                         **self._build_ltx2_model_kwargs(
                             ctx,
                             base_model_kwargs,
-                            encoder_hidden_states=encoder_hidden_states,
-                            audio_encoder_hidden_states=audio_encoder_hidden_states,
-                            encoder_attention_mask=encoder_attention_mask,
-                            disable_a2v_cross_attn=True,
-                            disable_v2a_cross_attn=True,
+                            encoder_hidden_states=negative_encoder_hidden_states,
+                            audio_encoder_hidden_states=negative_audio_encoder_hidden_states,
+                            encoder_attention_mask=negative_encoder_attention_mask,
                         )
                     )
-                v_mod = v_mod.float()
-                a_v_mod = a_v_mod.float()
+
+                v_pos = v_pos.float()
+                a_v_pos = a_v_pos.float()
+                v_neg = v_neg.float()
+                a_v_neg = a_v_neg.float()
+
+                v_ptb = None
+                a_v_ptb = None
+                if need_perturbed:
+                    with set_forward_context(
+                        current_timestep=step.step_index, attn_metadata=step.attn_metadata
+                    ):
+                        v_ptb, a_v_ptb = step.current_model(
+                            **self._build_ltx2_model_kwargs(
+                                ctx,
+                                base_model_kwargs,
+                                encoder_hidden_states=encoder_hidden_states,
+                                audio_encoder_hidden_states=audio_encoder_hidden_states,
+                                encoder_attention_mask=encoder_attention_mask,
+                                skip_video_self_attn_blocks=tuple(
+                                    stage1_guider_params["video_stg_blocks"]
+                                ),
+                                skip_audio_self_attn_blocks=tuple(
+                                    stage1_guider_params["audio_stg_blocks"]
+                                ),
+                            )
+                        )
+                    v_ptb = v_ptb.float()
+                    a_v_ptb = a_v_ptb.float()
+
+                v_mod = None
+                a_v_mod = None
+                if need_modality:
+                    with set_forward_context(
+                        current_timestep=step.step_index, attn_metadata=step.attn_metadata
+                    ):
+                        v_mod, a_v_mod = step.current_model(
+                            **self._build_ltx2_model_kwargs(
+                                ctx,
+                                base_model_kwargs,
+                                encoder_hidden_states=encoder_hidden_states,
+                                audio_encoder_hidden_states=audio_encoder_hidden_states,
+                                encoder_attention_mask=encoder_attention_mask,
+                                disable_a2v_cross_attn=True,
+                                disable_v2a_cross_attn=True,
+                            )
+                        )
+                    v_mod = v_mod.float()
+                    a_v_mod = a_v_mod.float()
         else:
             # NOTE: this flag must be identical across all SP ranks so that
             # every rank executes the same number of model-forward calls (each
