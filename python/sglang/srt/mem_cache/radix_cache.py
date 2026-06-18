@@ -243,6 +243,8 @@ class TreeNode:
         self.hash_value: Optional[List[str]] = None
         # priority for priority-aware eviction
         self.priority = priority
+        # wall-clock deadline (time.monotonic() seconds) set by cache_ttl_ms; None = no TTL
+        self.expires_at: Optional[float] = None
 
         self.id = TreeNode.counter if id is None else id
         TreeNode.counter += 1
@@ -423,6 +425,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         value = params.value
         priority = params.priority
         chunked = params.chunked
+        ttl_ms = params.ttl_ms
 
         key, value = key.maybe_to_bigram_view(self.is_eagle, value)
         key = key.page_aligned(self.page_size)
@@ -432,7 +435,9 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             # Debug/test fallback: use token ids themselves as values.
             value = torch.tensor(key.token_ids[: len(key)], dtype=torch.int64)
 
-        prefix_len = self._insert_helper(self.root_node, key, value, priority, chunked)
+        prefix_len = self._insert_helper(
+            self.root_node, key, value, priority, chunked, ttl_ms
+        )
         return InsertResult(prefix_len=prefix_len)
 
     def cache_finished_req(self, req: Req, is_insert: bool = True):
@@ -463,8 +468,9 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         # Radix Cache takes one ref in memory pool
         if is_insert:
             priority = getattr(req, "priority", 0) or 0
+            ttl_ms = getattr(req, "cache_ttl_ms", None)
             result = self.insert(
-                InsertParams(key=radix_key, value=values, priority=priority)
+                InsertParams(key=radix_key, value=values, priority=priority, ttl_ms=ttl_ms)
             )
             # Free the duplicates that were already in the tree
             self.token_to_kv_pool_allocator.free(
@@ -504,6 +510,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
                 value=values,
                 chunked=chunked,
                 priority=getattr(req, "priority", 0) or 0,
+                ttl_ms=getattr(req, "cache_ttl_ms", None),
             )
         )
         new_prefix_len = result.prefix_len
@@ -561,15 +568,23 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
 
         start_time = time.perf_counter()
         num_tokens = params.num_tokens
+        now = time.monotonic()
         leaves = list(self.evictable_leaves)
         eviction_heap = [
             (self.eviction_strategy.get_priority(node), node) for node in leaves
         ]
         heapq.heapify(eviction_heap)
 
+        # First pass: evict only nodes whose TTL has expired (or that have no TTL).
+        # Nodes with a live TTL are deferred into ttl_pinned for the fallback pass.
+        ttl_pinned = []
         num_evicted = 0
         while num_evicted < num_tokens and len(eviction_heap):
             _priority, x = heapq.heappop(eviction_heap)
+
+            if x.expires_at is not None and x.expires_at > now:
+                ttl_pinned.append((_priority, x))
+                continue
 
             self.token_to_kv_pool_allocator.free(x.value)
             num_evicted += len(x.value)
@@ -580,6 +595,20 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
                 heapq.heappush(eviction_heap, (new_priority, x.parent))
 
             self._record_remove_event(x)
+
+        # Fallback: if the normal pass could not free enough tokens, evict TTL-pinned
+        # nodes sorted by soonest expiry (RFC guarantee: hints never deadlock the pool).
+        if num_evicted < num_tokens and ttl_pinned:
+            ttl_pinned.sort(key=lambda t: t[1].expires_at)
+            for _priority, x in ttl_pinned:
+                if num_evicted >= num_tokens:
+                    break
+                if x.lock_ref != 0:
+                    continue
+                self.token_to_kv_pool_allocator.free(x.value)
+                num_evicted += len(x.value)
+                self._delete_leaf(x)
+                self._record_remove_event(x)
 
         self.update_eviction_metrics(num_evicted, start_time)
         return EvictResult(num_tokens_evicted=num_evicted)
@@ -703,11 +732,13 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         value,
         priority: int = 0,
         chunked: bool = False,
+        ttl_ms: Optional[int] = None,
     ):
         # Convert None priority to 0
         if priority is None:
             priority = 0
         access_time = time.monotonic()
+        expires_at = access_time + ttl_ms / 1000.0 if ttl_ms is not None else None
         node.last_access_time = access_time
         # Update priority along the path (take max to propagate higher priority)
         node.priority = max(node.priority, priority)
@@ -733,6 +764,10 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             else:
                 node.priority = max(node.priority, priority)
                 self._inc_hit_count(node, chunked)
+            # Refresh TTL on existing nodes along the matched path
+            if expires_at is not None:
+                if node.expires_at is None or expires_at > node.expires_at:
+                    node.expires_at = expires_at
             if len(key):
                 child_key = key.child_key(self.page_size)
 
@@ -741,6 +776,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             new_node.parent = node
             new_node.key = key
             new_node.value = value.clone()
+            new_node.expires_at = expires_at
             self._inc_hit_count(new_node, chunked)
             node.children[child_key] = new_node
             self.evictable_size_ += len(key)

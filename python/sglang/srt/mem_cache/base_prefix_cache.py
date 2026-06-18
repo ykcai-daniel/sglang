@@ -67,6 +67,9 @@ class InsertParams:
     # General
     chunked: bool = False
     priority: int = 0
+    # Soft pin: keep this entry resident until the wall-clock deadline (seconds).
+    # The engine may still evict it under severe memory pressure.
+    ttl_ms: Optional[int] = None
 
 
 @dataclasses.dataclass

@@ -241,6 +241,11 @@ class GenerateReqInput(BaseReq):
     # Priority for the request
     priority: Optional[int] = None
 
+    # KV cache TTL: keep this request's cached KV resident for at least this many
+    # milliseconds after insertion. The engine may still evict it under severe memory
+    # pressure (fallback to soonest-expiry eviction). None = no TTL (default LRU behaviour).
+    cache_ttl_ms: Optional[int] = None
+
     # Extra key for classifying the request (e.g. cache_salt)
     extra_key: Optional[Union[List[str], str]] = None
 
